@@ -26,7 +26,7 @@ Following Kim et al. (2025),[^2] we developed the baseline in three steps:
 Given the strong performance by large models that are well regularized, we speculate that larger models have a strong simplicity bias, amplified by regularization.
 
 ![Overparametrization](overparametrization.png)
-*Figure taken from Andrew Gordon Wilson, ["Deep Learning is Not So Mysterious or Different."](https://arxiv.org/abs/2504.07320)*
+*Figure taken from Andrew Gordon Wilson, ["Deep Learning is Not So Mysterious or Different."](https://arxiv.org/abs/2503.02113)*
 
 ## Why 100M tokens? 
 
