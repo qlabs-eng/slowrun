@@ -553,11 +553,19 @@ class DataLoader:
     def __iter__(self):
         return self
 
+    def _shuffle(self):
+        """Shuffle batch order for the new epoch, consistent across ranks."""
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        perm = torch.randperm(self.num_steps, generator=g)
+        self.rank_data = self.rank_data[perm]
+
     def __next__(self):
         if self.pos >= self.num_steps:
             self.pos = 0
             self.epoch += 1
             print0(f"Starting epoch {self.epoch}")
+            self._shuffle()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
