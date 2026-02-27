@@ -16,9 +16,11 @@ For now the unlimited track lives in the root directory, the ensemble track live
 
 ## Unlimited Compute Leaderboard 
 
-| # | Val Loss | Description | Date | Log | Contributors |
+| # | Val Loss | Description | Date | Time | Contributors |
 | - | - | - | - | - | - |
-1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | - | [@akshayvegesna](https://x.com/akshayvegesna)
+1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [@akshayvegesna](https://x.com/akshayvegesna)
+2 | 3.376 | Add shuffling every epoch | 02/27/26 | \~47 mins | [@kvegesna](https://x.com/karvegas_)
+
 
 ## Why limited data, unlimited compute? 
 
