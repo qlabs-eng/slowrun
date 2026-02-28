@@ -19,17 +19,17 @@ For now the limited track lives in the root directory, and the unlimited track l
 
 The limited-compute track caps runs at a single 8xH100 node for at most 1 hour. 
 
-| # | Val Loss | Description | Date | Time | Contributors |
-| - | - | - | - | - | - |
-1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [@akshayvegesna](https://x.com/akshayvegesna)
-2 | 3.376 | Add shuffling every epoch | 02/27/26 | \~47 mins | [@kvegesna](https://x.com/karvegas_)
+| # | Val Loss | Description | Date | Time | Script | Contributors |
+| - | - | - | - | - | - | - |
+1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0d49316316dc6684049a679e03958c3fb612a8fd/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+2 | 3.376 | Add shuffling every epoch | 02/27/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/106a290604abb6d8c5b0c3cc94c3b0eb6fe87dff/train.py) | [@kvegesna](https://x.com/karvegas_)
 
 ### Unlimited Compute 
 
-| # | Val Loss | Description | Date | Time | Contributors |
-| - | - | - | - | - | - |
-1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [@akshayvegesna](https://x.com/akshayvegesna)
-2 | 3.264 | Baseline: 8 × 2.7B transformer, Muon, dropout 0.1, weight decay 1.6, logit averaging | 02/27/26 | 6h 44m | [@akshayvegesna](https://x.com/akshayvegesna)
+| # | Val Loss | Description | Date | Time | Script | Contributors |
+| - | - | - | - | - | - | - |
+1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0d49316316dc6684049a679e03958c3fb612a8fd/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+2 | 3.264 | Baseline: 8 × 2.7B transformer, Muon, dropout 0.1, weight decay 1.6, logit averaging | 02/27/26 | 6h 44m | [Script](https://github.com/qlabs-eng/slowrun/blob/106a290604abb6d8c5b0c3cc94c3b0eb6fe87dff/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 
 ## Why limited data, unlimited compute? 
 
