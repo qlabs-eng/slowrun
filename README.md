@@ -13,6 +13,17 @@ The baseline trains in \~47 minutes on 8xH100 (\~$12) and achieves 3.402 val los
 
 For now the limited track lives in the root directory, and the unlimited track lives at [unlimited/](unlimited/). Submit an entry by opening a PR.
 
+## Running the current record
+
+To run the current record, run the following commands.
+
+```bash
+git clone https://github.com/qlabs-eng/slowrun.git && cd slowrun
+uv pip install -r requirements.txt # or use pip install if you don't have uv installed
+python prepare_data.py --train_tokens 100_000_000 --val_tokens 10_000_000 --local_dir fineweb_data
+torchrun --standalone --nproc_per_node=8 train.py
+```
+
 ## Leaderboards
 
 ### Limited Compute 
