@@ -7,11 +7,12 @@ NanoGPT Slowrun is a new benchmark for language modeling algorithms in the infin
 
 When speed is not the binding constraint, the space of promising algorithms changes dramatically--for example, large models trained with heavy regularization, expensive optimizers, and evolutionary search are all fair game. We want leaps like GPT-3, where previously unimaginable compute led to better generalization. That doesn't happen if wall-clock time is your constraint.
 
-The baseline trains in \~47 minutes on 8xH100 (\~$12) and achieves 3.402 val loss. There are two tracks: 
+The baseline trains in \~47 minutes on 8xH100 (\~$12) and achieves 3.402 val loss. There are three tracks: 
 1. a limited compute track capped at a single 8xH100 node for 1 hour (this is 100x the compute used by the Nanochat 1-epoch baseline),
-2. and an unlimited compute track with minimal restrictions on hardware or time. 
+2. a tiny compute track capped at a single 8xH100 node for 15 minutes,
+3. and an unlimited compute track with minimal restrictions on hardware or time. 
 
-For now the limited track lives in the root directory, and the unlimited track lives at [unlimited/](unlimited/). Submit an entry by opening a PR.
+For now the limited track lives in the root directory, the tiny track lives at [tiny/](tiny/), and the unlimited track lives at [unlimited/](unlimited/). Submit an entry by opening a PR.
 
 ## Running the current record 
 
@@ -23,9 +24,11 @@ python prepare_data.py
 torchrun --standalone --nproc_per_node=8 train.py
 ```
 
-## Leaderboards
+## World Record History
 
-### Limited Compute 
+We accept PRs that achieve a new World Record validation loss within the track's time limit, and add an entry below for each improvement.
+
+### Limited Compute Track (1 hour) 
 
 The limited-compute track caps runs at a single 8xH100 node for at most 1 hour. 
 
@@ -33,15 +36,27 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 | - | - | - | - | - | - | - |
 1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0d49316316dc6684049a679e03958c3fb612a8fd/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 2 | 3.376 | Add shuffling every epoch | 02/27/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/106a290604abb6d8c5b0c3cc94c3b0eb6fe87dff/train.py) | [@kvegesna](https://x.com/karvegas_)
-3 | 3.349 | Change value embed tables to projections from x0 | 02/28/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/b261fba252920582076cf8c77dedf9251fe7f7ed/train.py) | [@ms337](https://x.com/madhavsinghal_)
-3 | 3.335 | Use swiglu activation | 02/28/26 | 52.1 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/22d4a24ec53633c16d643779900ac3e9d10643a3/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+3 | 3.349 | Change value embed tables to projections from x0 | 03/01/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/b261fba252920582076cf8c77dedf9251fe7f7ed/train.py) | [@ms337](https://x.com/madhavsinghal_)
+4 | 3.335 | Use swiglu activation | 03/01/26 | 52.1 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/22d4a24ec53633c16d643779900ac3e9d10643a3/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 
-### Unlimited Compute 
+
+### Tiny Track (15 minutes)
+
+The tiny track caps runs at a single 8xH100 node for at most 15 minutes. 
+
+| # | Val Loss | Description | Date | Time | Script | Contributors |
+| - | - | - | - | - | - | - |
+1 | 3.428 | Baseline: 300M transformer, weight decay 0.8, dropout 0.1 | 03/02/26 | 13.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/22c1618d843a692384b0329f309ddfb4b5df9ff6/tiny/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+
+
+### Unlimited Compute Track 
 
 | # | Val Loss | Description | Date | Time | Script | Contributors |
 | - | - | - | - | - | - | - |
 1 | 3.402 | Baseline: 2.7B transformer, Muon, dropout 0.1, weight decay 1.6 | 02/26/26 | \~47 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0d49316316dc6684049a679e03958c3fb612a8fd/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 2 | 3.264 | Baseline: 8 × 2.7B transformer, Muon, dropout 0.1, weight decay 1.6, logit averaging | 02/27/26 | 6h 44m | [Script](https://github.com/qlabs-eng/slowrun/blob/106a290604abb6d8c5b0c3cc94c3b0eb6fe87dff/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+3 | 3.218 | Use value projections and swiglu activation | 03/02/26 | 6h 54m | [Script](https://github.com/qlabs-eng/slowrun/blob/4681cfd6fa8266fc6cbbf2af947773e188599857/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+
 
 ## Why limited data, unlimited compute? 
 
