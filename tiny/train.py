@@ -231,10 +231,9 @@ class MLP(nn.Module):
         self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
+        return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x))
 
 
 class Block(nn.Module):
