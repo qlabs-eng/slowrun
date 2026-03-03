@@ -51,8 +51,6 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--batch-schedule", action="store_true", default=False,
-                    help="Enable 3-stage batch size ramp (0.5x -> 1x -> 1.5x total_batch_size)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -90,7 +88,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.6
+WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
@@ -354,16 +352,12 @@ polar_express_coeffs = [
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+    p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
-    step_size = lr_t / bias1
-    update = exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t)
-    # Cautious weight decay: only decay where update and param agree in sign
-    mask = (update * p) > 0
-    update.add_(p * mask, alpha=wd_t)
-    p.add_(update, alpha=-step_size)
+    p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
@@ -716,55 +710,14 @@ x, y, current_epoch = next(train_loader)
 # Training config
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-base_grad_accum = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-# Batch size schedule: ramp from small -> medium -> large over 3 equal epoch stages.
-# Rationale: small batches give more gradient updates per token early (better exploration);
-# large batches are more compute-efficient later (faster wall-clock convergence).
-# LR schedule uses token-based warmdown (not step-based) to stay smooth across stage transitions.
-if args.batch_schedule and args.num_epochs >= 3:
-    _n = args.num_epochs
-    _e1 = _n // 3
-    _e2 = _n // 3
-    _ga_small = max(1, base_grad_accum // 2)
-    _ga_med   = base_grad_accum
-    _ga_large = base_grad_accum + base_grad_accum // 2
-    _batch_stages = [
-        (1,               _e1,          _ga_small),   # 0.5x batch
-        (_e1 + 1,         _e1 + _e2,    _ga_med),     # 1.0x batch
-        (_e1 + _e2 + 1,   _n,           _ga_large),   # 1.5x batch
-    ]
-    num_iterations = 0
-    for _s, _e, _ga in _batch_stages:
-        _n_ep = _e - _s + 1
-        num_iterations += round(TOKENS_PER_EPOCH * _n_ep / (_ga * tokens_per_fwdbwd))
-    # Total tokens for token-based LR schedule
-    _total_train_tokens = TOKENS_PER_EPOCH * args.num_epochs
-    _tokens_consumed = 0  # tracked during training
-    def get_batch_stage(epoch):
-        for s, e, ga in _batch_stages:
-            if s <= epoch <= e:
-                return ga, 1.0
-        return _batch_stages[-1][2], 1.0
-    print0(f"Batch schedule enabled (3 stages, token-based LR):")
-    for i, (s, e, ga) in enumerate(_batch_stages):
-        print0(f"  Stage {i+1}: epochs {s}-{e}, batch={ga * tokens_per_fwdbwd:,} tok, grad_accum={ga}")
-    print0(f"  Total tokens: {_total_train_tokens:,}, warmdown over last 50% of tokens")
-else:
-    num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
-    _total_train_tokens = 0  # not used
-    _tokens_consumed = 0     # not used
-    def get_batch_stage(_epoch):
-        return base_grad_accum, 1.0
-
-grad_accum_steps = base_grad_accum  # initial value
-print0(f"Base batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {base_grad_accum} steps")
+grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
+print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
 def get_lr_multiplier(it):
-    """Step-based LR schedule (used when batch schedule is OFF)."""
     warmup = round(WARMUP_RATIO * num_iterations)
     warmdown = round(WARMDOWN_RATIO * num_iterations)
     if it < warmup: return (it + 1) / warmup
@@ -773,28 +726,8 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown
         return progress + (1 - progress) * FINAL_LR_FRAC
 
-def get_lr_multiplier_tokens(tokens_consumed, total_tokens):
-    """Token-based LR schedule (used when batch schedule is ON).
-    Warmdown is computed over tokens, so it stays smooth across batch size changes."""
-    warmup_tokens = WARMUP_RATIO * total_tokens
-    warmdown_tokens = WARMDOWN_RATIO * total_tokens
-    warmdown_start = total_tokens - warmdown_tokens
-    if tokens_consumed < warmup_tokens:
-        return (tokens_consumed + 1) / warmup_tokens if warmup_tokens > 0 else 1.0
-    elif tokens_consumed <= warmdown_start:
-        return 1.0
-    else:
-        progress = (total_tokens - tokens_consumed) / warmdown_tokens
-        return max(0.0, progress + (1 - progress) * FINAL_LR_FRAC)
-
 def get_muon_momentum(it):
-    warmup = (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
-    cooldown_steps = 50
-    cooldown_start = num_iterations - cooldown_steps
-    if it >= cooldown_start:
-        frac = (it - cooldown_start) / cooldown_steps
-        return 0.95 - frac * 0.10
-    return warmup
+    return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
 # Training loop
 step = 0
@@ -817,46 +750,25 @@ min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
-    # Get batch schedule for current epoch
-    current_ga, current_lr_scale = get_batch_stage(current_epoch)
-    current_batch_size = current_ga * tokens_per_fwdbwd
-
     # Training step
     synchronize()
     t0 = time.time()
-    for micro_step in range(current_ga):
+    for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
         train_loss = loss.detach()
-        (loss / current_ga).backward()
+        (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
-    # NaN/Inf guard: skip optimizer step on bad gradients to prevent unrecoverable divergence
+    # Update optimizer
+    lrm = get_lr_multiplier(step)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * lrm
+        if group['kind'] == 'muon':
+            group["momentum"] = get_muon_momentum(step)
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
-    _bad_step = not math.isfinite(train_loss_f)
-    if ddp:
-        _bad_flag = torch.tensor([1.0 if _bad_step else 0.0], device=device)
-        dist.all_reduce(_bad_flag, op=dist.ReduceOp.MAX)
-        _bad_step = _bad_flag.item() > 0
-
-    if _bad_step:
-        model.zero_grad(set_to_none=True)
-        print0(f"  [WARN] NaN/Inf loss detected at step {step+1}, skipping optimizer update")
-    else:
-        # Update optimizer
-        # Use token-based LR schedule when batch schedule is active (smooth across batch size changes),
-        # otherwise use the original step-based schedule.
-        if args.batch_schedule and _total_train_tokens > 0:
-            _tokens_consumed += current_batch_size
-            lrm = get_lr_multiplier_tokens(_tokens_consumed, _total_train_tokens) * current_lr_scale
-        else:
-            lrm = get_lr_multiplier(step) * current_lr_scale
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-            if group['kind'] == 'muon':
-                group["momentum"] = get_muon_momentum(step)
-        optimizer.step()
-        model.zero_grad(set_to_none=True)
     synchronize()
     dt = time.time() - t0
 
@@ -867,8 +779,8 @@ while current_epoch <= args.num_epochs:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
-    tok_per_sec = int(current_batch_size / dt)
-    mfu = 100 * num_flops_per_token * current_batch_size / dt / (gpu_peak_flops * ddp_world_size)
+    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt
     steps_done = step - 10
@@ -940,4 +852,3 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-
