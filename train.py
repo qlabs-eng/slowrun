@@ -232,8 +232,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, config.n_embd))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer, config.n_embd))
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
@@ -258,7 +258,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        self.resid_lambdas.fill_(1.1)
+        self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
