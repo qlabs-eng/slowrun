@@ -741,6 +741,34 @@ def get_lr_multiplier(it):
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
+# SWA (Stochastic Weight Averaging)
+class SWA:
+    def __init__(self):
+        self.shadow = {}
+        self.count = 0
+    def update(self, model):
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                if name not in self.shadow:
+                    self.shadow[name] = p.data.clone()
+                else:
+                    self.shadow[name].lerp_(p.data, 1 / (self.count + 1))
+        self.count += 1
+    def apply(self, model):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                self.backup[name] = p.data.clone()
+                p.data.copy_(self.shadow[name])
+    def restore(self, model):
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.backup:
+                p.data.copy_(self.backup[name])
+
+SWA_START_FRAC = 0.75  # collect checkpoints in last 25% of training
+SWA_EVERY = 10         # collect every 10 steps
+swa = SWA()
+
 # Training loop
 step = 0
 min_val_bpb = float("inf")
@@ -780,6 +808,11 @@ while current_epoch <= args.num_epochs:
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    # SWA collection during late training
+    if step >= int(SWA_START_FRAC * num_iterations) and step % SWA_EVERY == 0:
+        swa.update(orig_model)
+        if swa.count == 1:
+            print0(f"SWA: started collecting (step {step})")
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -834,6 +867,22 @@ while current_epoch <= args.num_epochs:
     # GC management
     if step == 1:
         gc.collect(); gc.freeze(); gc.disable()
+
+# SWA final evaluation
+if swa.count > 0:
+    print0(f"SWA: collected {swa.count} checkpoints, evaluating averaged model...")
+    model.eval()
+    swa.apply(orig_model)
+    val_loader_swa = build_val_loader()
+    with autocast_ctx:
+        swa_bpb, swa_loss = evaluate_bpb(model, val_loader_swa, eval_steps, token_bytes)
+    swa.restore(orig_model)
+    print0(f"SWA Val BPB: {swa_bpb:.6f} | SWA Val Loss: {swa_loss:.6f}")
+    wandb_run.log({"step": step, "val/swa_bpb": swa_bpb, "val/swa_loss": swa_loss})
+    if swa_bpb < min_val_bpb:
+        min_val_bpb = swa_bpb
+        min_val_loss = swa_loss
+        print0("SWA improved over best val loss!")
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
