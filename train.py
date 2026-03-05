@@ -33,8 +33,8 @@ _script_start = time.time()
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=12)
+parser.add_argument("--device-batch-size", type=int, default=8)
+parser.add_argument("--num-epochs", type=int, default=15)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.5)
