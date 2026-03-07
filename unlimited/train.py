@@ -1,7 +1,7 @@
 """
 Train an ensemble of language models and evaluate running ensemble val loss.
 
-Trains N models (default 8) with different random seeds, shuffling data each epoch.
+Trains N models (default 6) with different random seeds, shuffling data each epoch.
 After each model is trained, computes ensemble val loss by averaging logits across
 all models trained so far.
 
@@ -52,9 +52,11 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--num-models", type=int, default=8, help="Number of ensemble members")
+parser.add_argument("--num-models", type=int, default=6, help="Number of ensemble members")
 parser.add_argument("--checkpoint-base", type=str, default="checkpoints", help="Base directory for checkpoints")
 parser.add_argument("--resume", type=str, default=None, help="Run ID to resume from (e.g. 20250226_143000)")
+parser.add_argument("--distill-alpha", type=float, default=0.5, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
+parser.add_argument("--distill-temperature", type=float, default=1.0, help="Temperature for softening teacher logits")
 args = parser.parse_args()
 
 if args.output_json and not args.save_result:
@@ -713,12 +715,38 @@ def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocas
 
 
 # =============================================================================
+# Teacher loading for distillation
+# =============================================================================
+
+def load_teacher_models(checkpoint_paths, config, device):
+    """Load previously trained models as frozen teachers for distillation."""
+    teachers = []
+    for ckpt_path in checkpoint_paths:
+        with torch.device("meta"):
+            m = GPT(config)
+        m.to_empty(device=device)
+        m.init_weights()
+        sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+        m.load_state_dict(sd)
+        m.eval()
+        teachers.append(m)
+        del sd
+    return teachers
+
+
+# =============================================================================
 # Training one model
 # =============================================================================
 
 def train_single_model(model_idx, seed, device, config, autocast_ctx, token_bytes,
-                       wandb_run, ddp, ddp_world_size, checkpoint_dir):
-    """Train a single model with the given seed. Returns path to saved checkpoint."""
+                       wandb_run, ddp, ddp_world_size, checkpoint_dir,
+                       teacher_checkpoint_paths=None):
+    """Train a single model with the given seed. Returns path to saved checkpoint.
+
+    If teacher_checkpoint_paths is non-empty, trains with knowledge distillation:
+    each model learns from both the hard labels and the averaged soft logits of
+    all previously trained models.
+    """
     print0(f"\n{'='*60}")
     print0(f"Training model {model_idx + 1} with seed {seed}")
     print0(f"{'='*60}")
@@ -775,6 +803,13 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     total_training_time = 0
     eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 
+    # Load teacher models for distillation (empty list = no distillation)
+    teacher_models = []
+    if teacher_checkpoint_paths:
+        print0(f"  [model {model_idx+1}] Loading {len(teacher_checkpoint_paths)} teacher model(s) for distillation...")
+        teacher_models = load_teacher_models(teacher_checkpoint_paths, config, device)
+        print0(f"  [model {model_idx+1}] Teachers loaded.")
+
     # Enable GC for fresh model
     gc.enable()
     gc.collect()
@@ -784,8 +819,45 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         synchronize()
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
-            with autocast_ctx:
-                loss = compiled_model(x, y)
+            if teacher_models:
+                # --- Distillation loss ---
+                # Teacher: averaged logits from all prior models (no grad)
+                with torch.inference_mode():
+                    teacher_avg = None
+                    for tm in teacher_models:
+                        with autocast_ctx:
+                            tl = tm.forward_logits(x).float()
+                        if teacher_avg is None:
+                            teacher_avg = tl.div_(len(teacher_models))
+                        else:
+                            teacher_avg.add_(tl, alpha=1.0 / len(teacher_models))
+                        del tl
+
+                # Student forward (logits only, so we can compute both losses)
+                with autocast_ctx:
+                    student_logits = compiled_model(x)
+
+                flat_s = student_logits.view(-1, student_logits.size(-1))
+                flat_t = teacher_avg.view(-1, teacher_avg.size(-1))
+                flat_y = y.view(-1)
+                mask = flat_y != -1
+
+                hard_loss = F.cross_entropy(flat_s, flat_y, ignore_index=-1)
+
+                T = args.distill_temperature
+                kl_loss = F.kl_div(
+                    F.log_softmax(flat_s[mask] / T, dim=-1),
+                    F.softmax(flat_t[mask] / T, dim=-1),
+                    reduction='batchmean',
+                ) * (T * T)
+
+                loss = (1 - args.distill_alpha) * hard_loss + args.distill_alpha * kl_loss
+                del teacher_avg
+            else:
+                # --- Standard cross-entropy loss ---
+                with autocast_ctx:
+                    loss = compiled_model(x, y)
+
             train_loss = loss.detach()
             (loss / grad_accum_steps).backward()
             x, y, epoch = next(train_loader)
@@ -851,6 +923,13 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
 
         if step == 1:
             gc.collect(); gc.freeze(); gc.disable()
+
+    # Free teacher models before saving (they're no longer needed)
+    if teacher_models:
+        del teacher_models
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # Save checkpoint (uncompiled model state_dict)
     checkpoint_path = os.path.join(checkpoint_dir, f"model_{model_idx}.pt")
@@ -979,7 +1058,7 @@ def main():
                 json.dump(progress, f, indent=2)
 
     for model_idx in range(resume_from, args.num_models):
-        # Train one model
+        # Train one model (pass all previously trained checkpoints as teachers)
         ckpt_path, best_bpb, best_loss = train_single_model(
             model_idx=model_idx,
             seed=seeds[model_idx],
@@ -991,6 +1070,7 @@ def main():
             ddp=ddp,
             ddp_world_size=ddp_world_size,
             checkpoint_dir=checkpoint_dir,
+            teacher_checkpoint_paths=list(checkpoint_paths),
         )
         checkpoint_paths.append(ckpt_path)
         individual_results.append({"model": model_idx + 1, "seed": seeds[model_idx],
