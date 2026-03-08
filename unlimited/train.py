@@ -1,7 +1,7 @@
 """
 Train an ensemble of language models and evaluate running ensemble val loss.
 
-Trains N models (default 6) with different random seeds, shuffling data each epoch.
+Trains N models (default 8) with different random seeds, shuffling data each epoch.
 After each model is trained, computes ensemble val loss by averaging logits across
 all models trained so far.
 
@@ -52,7 +52,7 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--num-models", type=int, default=6, help="Number of ensemble members")
+parser.add_argument("--num-models", type=int, default=8, help="Number of ensemble members")
 parser.add_argument("--checkpoint-base", type=str, default="checkpoints", help="Base directory for checkpoints")
 parser.add_argument("--resume", type=str, default=None, help="Run ID to resume from (e.g. 20250226_143000)")
 parser.add_argument("--distill-alpha", type=float, default=0.5, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
@@ -744,8 +744,9 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     """Train a single model with the given seed. Returns path to saved checkpoint.
 
     If teacher_checkpoint_paths is non-empty, trains with knowledge distillation:
-    each model learns from both the hard labels and the averaged soft logits of
-    all previously trained models.
+    each model learns from both the hard labels and the soft logits of the
+    immediately preceding model (chain distillation). Only one teacher is loaded
+    at a time, keeping memory usage constant regardless of ensemble size.
     """
     print0(f"\n{'='*60}")
     print0(f"Training model {model_idx + 1} with seed {seed}")
@@ -820,25 +821,18 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
             if teacher_models:
-                # --- Distillation loss ---
-                # Teacher: averaged logits from all prior models (no grad)
+                # --- Chain distillation loss ---
+                # Teacher: the single immediately preceding model (no grad)
                 with torch.inference_mode():
-                    teacher_avg = None
-                    for tm in teacher_models:
-                        with autocast_ctx:
-                            tl = tm.forward_logits(x).float()
-                        if teacher_avg is None:
-                            teacher_avg = tl.div_(len(teacher_models))
-                        else:
-                            teacher_avg.add_(tl, alpha=1.0 / len(teacher_models))
-                        del tl
+                    with autocast_ctx:
+                        teacher_logits = teacher_models[0].forward_logits(x).float()
 
                 # Student forward (logits only, so we can compute both losses)
                 with autocast_ctx:
                     student_logits = compiled_model(x)
 
                 flat_s = student_logits.view(-1, student_logits.size(-1))
-                flat_t = teacher_avg.view(-1, teacher_avg.size(-1))
+                flat_t = teacher_logits.view(-1, teacher_logits.size(-1))
                 flat_y = y.view(-1)
                 mask = flat_y != -1
 
@@ -852,7 +846,7 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
                 ) * (T * T)
 
                 loss = (1 - args.distill_alpha) * hard_loss + args.distill_alpha * kl_loss
-                del teacher_avg
+                del teacher_logits
             else:
                 # --- Standard cross-entropy loss ---
                 with autocast_ctx:
@@ -1058,7 +1052,8 @@ def main():
                 json.dump(progress, f, indent=2)
 
     for model_idx in range(resume_from, args.num_models):
-        # Train one model (pass all previously trained checkpoints as teachers)
+        # Chain distillation: only the immediately preceding model is the teacher
+        last_ckpt = [checkpoint_paths[-1]] if checkpoint_paths else []
         ckpt_path, best_bpb, best_loss = train_single_model(
             model_idx=model_idx,
             seed=seeds[model_idx],
@@ -1070,7 +1065,7 @@ def main():
             ddp=ddp,
             ddp_world_size=ddp_world_size,
             checkpoint_dir=checkpoint_dir,
-            teacher_checkpoint_paths=list(checkpoint_paths),
+            teacher_checkpoint_paths=last_ckpt,
         )
         checkpoint_paths.append(ckpt_path)
         individual_results.append({"model": model_idx + 1, "seed": seeds[model_idx],
