@@ -201,6 +201,11 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # XSA: remove self-value projection from attention output (arXiv 2603.09078)
+        vn = F.normalize(v, dim=-1)
+        if self.n_kv_head != self.n_head:
+            vn = vn.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+        y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -924,4 +929,3 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-
