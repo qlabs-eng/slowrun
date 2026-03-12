@@ -381,7 +381,10 @@ class GPT(nn.Module):
             # First pass: encoder boundary through end of dupe range
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
                                         self.encoder_layers, dupe[1])
-            # Replay: run dupe range again with same skip connections
+            # Replay 1: run dupe range again
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Replay 2: run dupe range a third time
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
                                         dupe[0], dupe[1])
             # Remaining decoder layers
