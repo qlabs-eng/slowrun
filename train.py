@@ -37,8 +37,8 @@ parser.add_argument("--device-batch-size", type=int, default=4)
 parser.add_argument("--num-epochs", type=int, default=12)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
-parser.add_argument("--scalar-lr", type=float, default=0.5)
-parser.add_argument("--matrix-lr", type=float, default=0.08)
+parser.add_argument("--scalar-lr", type=float, default=0.1)
+parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=1.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
@@ -81,8 +81,8 @@ DATA_DIR = "fineweb_data"
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
 BASE_SCALAR_LR = args.scalar_lr
-BASE_EMBEDDING_LR = 0.3
-BASE_UNEMBEDDING_LR = 0.004
+BASE_EMBEDDING_LR = 0.15
+BASE_UNEMBEDDING_LR = 0.002
 
 # Apply LR multiplier if provided (scales all LRs uniformly)
 _lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
@@ -94,7 +94,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.4
+WARMDOWN_RATIO = 0.2
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
