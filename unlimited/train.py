@@ -68,7 +68,7 @@ parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--num-models", type=int, default=10, help="Number of ensemble members")
 parser.add_argument("--checkpoint-base", type=str, default="checkpoints", help="Base directory for checkpoints")
 parser.add_argument("--resume", type=str, default=None, help="Run ID to resume from (e.g. 20250226_143000)")
-parser.add_argument("--distill-alpha", type=float, default=0.7, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
+parser.add_argument("--distill-alpha", type=float, default=0.5, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
 parser.add_argument("--distill-temperature", type=float, default=1.0, help="Temperature for softening teacher logits")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
                     help="First decoder layer to duplicate (inclusive)")
