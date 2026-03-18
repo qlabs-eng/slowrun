@@ -65,6 +65,8 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--update-ema-every", type=int, default=10)
+parser.add_argument("--ema-decay-per-epoch", type=float, default=0.5)
 args = parser.parse_args()
 
 # Resolve output path
@@ -184,7 +186,7 @@ class GPTConfig:
     n_kv_head: int = N_HEAD
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
-    dropout: float = 0.1         
+    dropout: float = 0.1
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -312,7 +314,7 @@ class GPT(nn.Module):
         self.resid_lambdas.fill_(1.1)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
-            torch.nn.init.uniform_(proj.weight, -s, s)  
+            torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
@@ -632,7 +634,7 @@ class DataLoader:
         g.manual_seed(self.epoch)
         perm = torch.randperm(self.num_steps, generator=g)
         self.rank_data = self.rank_data[perm]
-        
+
     def __next__(self):
         if self.pos >= self.num_steps:
             self.pos = 0
@@ -642,7 +644,7 @@ class DataLoader:
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
-        
+
 # =============================================================================
 # Loss evaluation
 # =============================================================================
@@ -812,6 +814,9 @@ epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+steps_per_epoch = num_iterations / args.num_epochs
+ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
+ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
 
 wall_clock_start = time.time()
 
@@ -858,6 +863,8 @@ while current_epoch <= args.num_epochs:
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    if ema_params is not None and step % args.update_ema_every == 0:
+        torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - ema_beta)
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -909,6 +916,26 @@ while current_epoch <= args.num_epochs:
     if step == 1:
         gc.collect(); gc.freeze(); gc.disable()
 
+# Final EMA evaluation
+if ema_params is not None:
+    ema_updates = step // args.update_ema_every
+    if ema_updates > 0:
+        correction = 1.0 / (1.0 - ema_beta ** ema_updates)
+        model.eval()
+        with torch.no_grad():
+            for p, ema in zip(model.parameters(), ema_params):
+                p.copy_(ema * correction)
+        val_loader = build_val_loader()
+        with autocast_ctx:
+            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
+        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
+        val_bpb = ema_bpb
+        val_loss = ema_loss
+        if ema_bpb < min_val_bpb:
+            min_val_bpb = ema_bpb
+            min_val_loss = ema_loss
+
 # Summary
 wall_clock_time = time.time() - wall_clock_start
 print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
@@ -940,4 +967,4 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-    
+
