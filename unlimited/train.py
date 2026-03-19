@@ -46,35 +46,39 @@ import tiktoken
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT ensemble")
-parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs-model-0", type=int, default=18, help="Epochs for first model (defaults to --num-epochs)")
-parser.add_argument("--num-epochs", type=int, default=24, help="Total epochs for models that are not model 0")
+parser.add_argument("--device-batch-size", type=int, default=2)
+parser.add_argument("--num-epochs-model-0", type=int, default=16, help="Epochs for first model (defaults to --num-epochs)")
+parser.add_argument("--num-epochs", type=int, default=32, help="Total epochs for models that are not model 0")
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
-parser.add_argument("--scalar-lr", type=float, default=0.5)
-parser.add_argument("--matrix-lr", type=float, default=0.08)
-parser.add_argument("--weight-decay", type=float, default=1.6)
+parser.add_argument("--scalar-lr", type=float, default=0.1)
+parser.add_argument("--matrix-lr", type=float, default=0.04)
+parser.add_argument("--weight-decay", type=float, default=1.3)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=30)
-parser.add_argument("--n_head", type=int, default=14)
-parser.add_argument("--n_embd", type=int, default=1792)
+parser.add_argument("--n_head", type=int, default=16)
+parser.add_argument("--n_embd", type=int, default=2048)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--num-models", type=int, default=12, help="Number of ensemble members")
+parser.add_argument("--num-models", type=int, default=10, help="Number of ensemble members")
 parser.add_argument("--checkpoint-base", type=str, default="checkpoints", help="Base directory for checkpoints")
 parser.add_argument("--resume", type=str, default=None, help="Run ID to resume from (e.g. 20250226_143000)")
-parser.add_argument("--distill-alpha", type=float, default=0.5, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
+parser.add_argument("--distill-alpha", type=float, default=0.7, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
 parser.add_argument("--distill-temperature", type=float, default=1.0, help="Temperature for softening teacher logits")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
                     help="First decoder layer to duplicate (inclusive)")
-parser.add_argument("--dupe-layers-end", type=int, default=21,
+parser.add_argument("--dupe-layers-end", type=int, default=25,
                     help="Last decoder layer to duplicate (exclusive)")
-parser.add_argument("--dupe-fraction", type=float, default=0.75, help="Dupe layers activate for the last (1 - this) fraction of epochs")
+parser.add_argument("--dupe-fraction", type=float, default=0.5, help="Dupe layers activate for the last (1 - this) fraction of epochs") # default is 7/12
+parser.add_argument("--ema-decays", type=str, default="0.95",
+                    help="Comma-separated EMA decay rates, e.g. '0.999,0.9995,0.9998'")
+parser.add_argument("--ema-start-frac", type=float, default=0.90,
+                    help="Fraction of training after which to start EMA tracking")
 args = parser.parse_args()
 
 if args.output_json and not args.save_result:
@@ -96,8 +100,8 @@ DATA_DIR = "fineweb_data"
 
 BASE_MATRIX_LR = args.matrix_lr
 BASE_SCALAR_LR = args.scalar_lr
-BASE_EMBEDDING_LR = 0.3
-BASE_UNEMBEDDING_LR = 0.004
+BASE_EMBEDDING_LR = 0.15
+BASE_UNEMBEDDING_LR = 0.002
 
 _lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
 MATRIX_LR = BASE_MATRIX_LR * _lr_mult
@@ -108,7 +112,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.5
+WARMDOWN_RATIO = 0.2
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
@@ -128,6 +132,39 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
+
+# =============================================================================
+# EMA (Exponential Moving Average) for weight averaging
+# =============================================================================
+
+class EMATracker:
+    """Maintains EMA shadow weights on CPU for memory efficiency."""
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {name: p.data.float().cpu().clone() for name, p in model.named_parameters()}
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        d = self.decay
+        for name, p in model.named_parameters():
+            self.shadow[name].lerp_(p.data.float().cpu(), 1 - d)
+
+    def apply_to(self, model):
+        """Copy EMA weights into model (for evaluation)."""
+        for name, p in model.named_parameters():
+            p.data.copy_(self.shadow[name].to(p.device, dtype=p.dtype))
+
+    def state_dict(self):
+        return dict(self.shadow)
+
+
+def load_state_dict_into_model(model, state_dict):
+    """Load a state dict into model, handling dtype conversion."""
+    for name, p in model.named_parameters():
+        if name in state_dict:
+            p.data.copy_(state_dict[name].to(p.device, dtype=p.dtype))
 
 # =============================================================================
 # Flash Attention
@@ -279,7 +316,7 @@ class GPT(nn.Module):
         print0(f"Dupe layers {start}-{end-1}: decoder layers repeated with skip connections")
 
     @torch.no_grad()
-    def init_weights(self):
+    def init_weights(self, convert_embed=True):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
@@ -303,7 +340,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        if self.transformer.wte.weight.device.type == "cuda":
+        if convert_embed and self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
         self._dupe_layers = None
 
@@ -396,6 +433,9 @@ class GPT(nn.Module):
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
                                         dupe[0], dupe[1])
             # Replay 3
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Replay 4
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
                                         dupe[0], dupe[1])
             # Remaining decoder layers
@@ -703,7 +743,7 @@ def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocas
         with torch.device("meta"):
             model = GPT(config)
         model.to_empty(device=device)
-        model.init_weights()  # initializes rotary buffers (non-persistent, not in state_dict)
+        model.init_weights(convert_embed=False)  # initializes rotary buffers only; skip bfloat16 embed cast
         state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
         model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
@@ -753,7 +793,7 @@ def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocas
         num_bytes2d = token_bytes[flat_y]
         total_nats += (loss2d * (num_bytes2d > 0)).sum().double()
         total_bytes += num_bytes2d.sum()
-        
+
         del logits_sum, avg_logits
 
     # Cleanup all models
@@ -785,7 +825,7 @@ def load_teacher_models(checkpoint_paths, config, device):
         with torch.device("meta"):
             m = GPT(config)
         m.to_empty(device=device)
-        m.init_weights()
+        m.init_weights(convert_embed=False)
         sd = torch.load(ckpt_path, map_location=device, weights_only=True)
         m.load_state_dict(sd)
         m.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
@@ -845,7 +885,8 @@ def evaluate_distill_val(student, teacher, batches, steps, autocast_ctx, alpha, 
     val_teacher_ce = total_teacher_ce.item() / n
     val_combined   = (1 - alpha) * (total_student_ce.item() / n) + alpha * val_kl
     return val_kl, val_combined, val_teacher_ce
-    
+
+
 def train_single_model(model_idx, seed, device, config, autocast_ctx, token_bytes,
                        wandb_run, ddp, ddp_world_size, checkpoint_dir,
                        teacher_checkpoint_paths=None, num_epochs=None):
@@ -855,6 +896,9 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     each model learns from both the hard labels and the soft logits of the
     immediately preceding model (chain distillation). Only one teacher is loaded
     at a time, keeping memory usage constant regardless of ensemble size.
+
+    After training, EMA-blended weights are evaluated and the best weights
+    (final or blended) are saved to the checkpoint.
     """
     print0(f"\n{'='*60}")
     print0(f"Training model {model_idx + 1} with seed {seed}")
@@ -870,11 +914,12 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     model.to_empty(device=device)
     model.init_weights()
 
-    # Keep reference to uncompiled model for dupe layer activation
+    # Keep reference to uncompiled model for dupe layer activation and EMA
     orig_model = model
 
     # Compile
     compiled_model = torch.compile(model, dynamic=False)
+
 
     # Optimizer
     optimizer = compiled_model.setup_optimizer()
@@ -885,10 +930,18 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     x, y, current_epoch = next(train_loader)
 
     # Training config
-    tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
+    normal_device_batch_size = args.device_batch_size
+    dupe_device_batch_size = args.device_batch_size // 2  # used during dupe for models 1+
+
+    tokens_per_fwdbwd = normal_device_batch_size * MAX_SEQ_LEN * ddp_world_size
     assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-    print0(f"  [model {model_idx+1}] Grad accum steps: {grad_accum_steps}")
+
+    dupe_tokens_per_fwdbwd = dupe_device_batch_size * MAX_SEQ_LEN * ddp_world_size
+    assert TOTAL_BATCH_SIZE % dupe_tokens_per_fwdbwd == 0
+    dupe_grad_accum_steps = TOTAL_BATCH_SIZE // dupe_tokens_per_fwdbwd
+
+    print0(f"  [model {model_idx+1}] Grad accum steps: {grad_accum_steps} (normal), {dupe_grad_accum_steps} (dupe, models 1+)")
     TOKENS_PER_EPOCH = train_loader.total_tokens
     num_iterations = round(TOKENS_PER_EPOCH * num_epochs / TOTAL_BATCH_SIZE)
 
@@ -898,6 +951,14 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     dupe_start_epoch = math.ceil(args.dupe_fraction * num_epochs) + 1  # epoch number (1-indexed) to activate
     dupe_active = False
     print0(f"  [model {model_idx+1}] Dupe layers will activate at epoch {dupe_start_epoch} (of {num_epochs})")
+
+    # EMA setup
+    ema_decays = [float(d) for d in args.ema_decays.split(",") if d.strip()] if args.ema_decays else []
+    ema_start_step = round(args.ema_start_frac * num_iterations)
+    ema_trackers = []
+    ema_initialized = False
+    if ema_decays:
+        print0(f"  [model {model_idx+1}] EMA decays: {ema_decays}, starting at step {ema_start_step} ({args.ema_start_frac*100:.0f}% of training)")
 
     # LR schedule
     def get_lr_multiplier(it):
@@ -943,6 +1004,15 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
             compiled_model = torch.compile(orig_model, dynamic=False)
             dupe_active = True
             gc.enable(); gc.collect()
+
+            if model_idx >= 1:
+                print0(f"  [model {model_idx+1}] Switching to dupe batch size {dupe_device_batch_size} "
+                    f"(grad_accum_steps: {grad_accum_steps} -> {dupe_grad_accum_steps})")
+                train_loader = DataLoader(_train_path, dupe_device_batch_size, MAX_SEQ_LEN, device=device, seed=seed)
+                train_loader.epoch = current_epoch
+                train_loader._shuffle_and_shard()
+                x, y, current_epoch = next(train_loader)
+                grad_accum_steps = dupe_grad_accum_steps
 
         synchronize()
         t0 = time.time()
@@ -990,6 +1060,7 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
             group["lr"] = group["initial_lr"] * lrm
             if group['kind'] == 'muon':
                 group["momentum"] = get_muon_momentum(step)
+        torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']], max_norm=1.0)
         optimizer.step()
         compiled_model.zero_grad(set_to_none=True)
         train_loss_f = train_loss.item()
@@ -998,6 +1069,15 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         toks_per_sec = TOTAL_BATCH_SIZE / dt
 
         step += 1
+
+        # EMA update (every 10 steps to minimize CPU copy overhead)
+        if ema_decays and step >= ema_start_step and step % 10 == 0:
+            if not ema_initialized:
+                print0(f"  [model {model_idx+1}] Initializing {len(ema_decays)} EMA tracker(s) at step {step}")
+                ema_trackers = [EMATracker(orig_model, d) for d in ema_decays]
+                ema_initialized = True
+            for ema in ema_trackers:
+                ema.update(orig_model)
 
         # Logging
         ema_beta = 0.9
@@ -1095,14 +1175,63 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # Save checkpoint (uncompiled model state_dict)
+    # =========================================================================
+    # Post-training: EMA blend evaluation
+    # Save the final model weights so we can restore after each blend eval,
+    # and compare blend vs final to pick the best checkpoint to save.
+    # =========================================================================
+    final_weights = {name: p.data.clone() for name, p in orig_model.named_parameters()}
+    best_weights = final_weights  # start with final as best
+    best_val_loss = min_val_loss
+    best_val_bpb = min_val_bpb
+
+    for ema in ema_trackers:
+        print0(f"\n  [model {model_idx+1}] --- Evaluating EMA blend (decay={ema.decay}, {ema.num_updates} updates) ---")
+        # Evaluate the known-best blend ratio: 0.6*final + 0.4*EMA
+        alpha = 0.6
+        blended_weights = {
+            name: (
+                alpha * final_weights[name]
+                + (1 - alpha) * ema.shadow[name].to(final_weights[name].device, dtype=final_weights[name].dtype)
+            )
+            for name in final_weights
+        }
+        load_state_dict_into_model(orig_model, blended_weights)
+        blend_model = torch.compile(orig_model, dynamic=False)
+        blend_model.eval()
+        _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
+        val_loader = DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device, seed=0)
+        with autocast_ctx:
+            blend_bpb, blend_loss = evaluate_bpb(blend_model, val_loader, eval_steps, token_bytes)
+        print0(f"  [model {model_idx+1}] Blend({alpha:.1f}*final+{1-alpha:.1f}*EMA {ema.decay}): Val BPB: {blend_bpb:.6f} | Val Loss: {blend_loss:.6f}")
+        wandb_run.log({
+            f"model_{model_idx+1}/ema_blend_bpb": blend_bpb,
+            f"model_{model_idx+1}/ema_blend_loss": blend_loss,
+            f"model_{model_idx+1}/ema_decay": ema.decay,
+        })
+        if blend_loss < best_val_loss:
+            best_val_loss = blend_loss
+            best_val_bpb = blend_bpb
+            best_weights = blended_weights
+            print0(f"  [model {model_idx+1}] ** New best! (blend {alpha:.1f}/{1-alpha:.1f} with EMA {ema.decay})")
+        # Restore final weights before evaluating the next EMA candidate
+        load_state_dict_into_model(orig_model, final_weights)
+
+    # Load the best weights into orig_model for checkpointing
+    if best_weights is not final_weights:
+        print0(f"  [model {model_idx+1}] Saving EMA-blended weights to checkpoint (val_loss={best_val_loss:.6f})")
+        load_state_dict_into_model(orig_model, best_weights)
+    else:
+        print0(f"  [model {model_idx+1}] Saving final weights to checkpoint (val_loss={best_val_loss:.6f})")
+
+    # Save checkpoint (uncompiled model state_dict — best of final vs EMA blend)
     checkpoint_path = os.path.join(checkpoint_dir, f"model_{model_idx}.pt")
     if int(os.environ.get('RANK', 0)) == 0:
         torch.save(orig_model.state_dict(), checkpoint_path)
     if ddp:
         dist.barrier()
 
-    print0(f"  [model {model_idx+1}] Done. Val BPB: {min_val_bpb:.6f} | Val Loss: {min_val_loss:.6f}")
+    print0(f"  [model {model_idx+1}] Done. Best Val BPB: {best_val_bpb:.6f} | Best Val Loss: {best_val_loss:.6f}")
     print0(f"  Checkpoint saved to {checkpoint_path}")
 
     # Cleanup
@@ -1112,7 +1241,7 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return checkpoint_path, min_val_bpb, min_val_loss
+    return checkpoint_path, best_val_bpb, best_val_loss
 
 
 # =============================================================================
@@ -1184,6 +1313,7 @@ def main():
     print0(f"  num_epochs={args.num_epochs}, dropout={args.dropout}")
     print0(f"  num_epochs_model_0={args.num_epochs_model_0}")
     print0(f"  dupe_layers={args.dupe_layers_start}-{args.dupe_layers_end} (last {100*(1-args.dupe_fraction):.0f}% of epochs)")
+    print0(f"  ema_decays={args.ema_decays}, ema_start_frac={args.ema_start_frac}")
     print0(f"  checkpoint_dir={checkpoint_dir}")
     print0(f"{'='*60}")
 
@@ -1266,6 +1396,7 @@ def main():
             "ensemble/val_loss": ens_loss,
         })
         save_progress()
+
         # Ensemble excluding model 0 — this is the reported ensemble metric,
         # since model 0 (no distillation teacher, fewer epochs) hurts ensemble quality.
         if len(checkpoint_paths) >= 2:
