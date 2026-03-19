@@ -78,7 +78,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 5 | 3.166 | Train each model for 1.5x longer | 03/05/26 | 10h 35m | [Script](https://github.com/qlabs-eng/slowrun/blob/6848b4a7b4d1373dead2c7ceaaf47927762b86c8/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 6 | 3.126 | Train each model in ensemble to distill previous model + usual CE loss | 03/07/26 | 16h 1m | [Script](https://github.com/qlabs-eng/slowrun/blob/4eb2cce258b9edb97862f65349e130507d7c433c/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 7 | 3.089 | Ensemble of 10 models, looping of layers 15-20, tuned epoch counts, loss weight | 03/13/26 | 19h 18m (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/5c6ecd540cd789eef50fe894302da82b670fcc93/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
-8 | 3.081 | Ensemble of 12 models, distill alpha 0.5 | 03/18/26 | ~44 hours (1 node, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/7dc6c386ae6ccf8bc8fa9b03cc53acf7723c4084/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
+8 | 3.081 | Ensemble of 12 models, distill alpha 0.5 | 03/18/26 | 42h 35m (1 node, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/7dc6c386ae6ccf8bc8fa9b03cc53acf7723c4084/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 
 
 
