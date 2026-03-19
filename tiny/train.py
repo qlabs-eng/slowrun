@@ -66,7 +66,7 @@ parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--update-ema-every", type=int, default=10)
-parser.add_argument("--ema-decay-per-epoch", type=float, default=0.5)
+parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 args = parser.parse_args()
 
 # Resolve output path
@@ -815,7 +815,7 @@ smooth_train_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 steps_per_epoch = num_iterations / args.num_epochs
-ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
+param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
 ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
 
 wall_clock_start = time.time()
@@ -864,7 +864,7 @@ while current_epoch <= args.num_epochs:
     optimizer.step()
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
-        torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - ema_beta)
+        torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -920,7 +920,7 @@ while current_epoch <= args.num_epochs:
 if ema_params is not None:
     ema_updates = step // args.update_ema_every
     if ema_updates > 0:
-        correction = 1.0 / (1.0 - ema_beta ** ema_updates)
+        correction = 1.0 / (1.0 - param_ema_beta ** ema_updates)
         model.eval()
         with torch.no_grad():
             for p, ema in zip(model.parameters(), ema_params):
