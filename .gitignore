@@ -1,3 +1,4 @@
 fineweb_data/
 wandb/
 checkpoints/
+logit_avg_ckpts/
