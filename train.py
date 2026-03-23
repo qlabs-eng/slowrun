@@ -372,8 +372,8 @@ class GPT(nn.Module):
                           + self.x0_lambdas.numel()
                           + self.skip_weights.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Causal attention: FA3 skips upper-triangular blocks → effective FLOPs ≈ T/2 per token
-        attn_flops = sum(6 * h * q * min(w[0], t) if w[0] >= 0 else 6 * h * q * t for w in self.window_sizes)
+        # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
+        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
