@@ -366,10 +366,14 @@ class GPT(nn.Module):
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        ve_numel = sum(p.weight.numel() for p in self.ve_projs.values())
-        nparams_exclude = self.transformer.wte.weight.numel() + ve_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        # Exclude non-matmul params: embedding lookup + elementwise scalars
+        nparams_exclude = (self.transformer.wte.weight.numel()
+                          + self.resid_lambdas.numel()
+                          + self.x0_lambdas.numel()
+                          + self.skip_weights.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
+        # Causal attention: FA3 skips upper-triangular blocks → effective FLOPs ≈ T/2 per token
+        attn_flops = sum(6 * h * q * min(w[0], t) if w[0] >= 0 else 6 * h * q * t for w in self.window_sizes)
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
