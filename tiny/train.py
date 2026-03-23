@@ -348,6 +348,12 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+        
+    def _avg_causal_attended_keys(self, window, seq_len):
+        if window < 0 or window >= seq_len - 1:
+            return (seq_len + 1) / 2
+        max_keys = min(window + 1, seq_len)
+        return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
