@@ -22,9 +22,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch._dynamo
 from torch import Tensor
 import wandb
 import tiktoken
+
+from trace_interpreter import FrozenTraceInterpreter
+
+torch._dynamo.config.cache_size_limit = 64
+torch._dynamo.config.recompile_limit = 64
 
 _script_start = time.time()
 
@@ -61,10 +67,14 @@ parser.add_argument("--dupe-loops", type=int, default=2,
                     help="Number of extra replay passes through dupe layers")
 parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio (default 0.4)")
-parser.add_argument("--logit-cap", type=float, default=10.0,
-                    help="Logit soft-capping value (0=disabled)")
-parser.add_argument("--logit-avg", type=int, default=3,
-                    help="Number of late checkpoints for logit (probability) averaging (0=disabled)")
+parser.add_argument("--ema-decays", type=str, default="0.95",
+                    help="Comma-separated EMA decay rates, e.g. '0.999,0.9995,0.9998'")
+parser.add_argument("--ema-start-frac", type=float, default=0.90,
+                    help="Fraction of training after which to start EMA tracking")
+parser.add_argument("--checkpoint-avg", type=int, default=0,
+                    help="Number of late checkpoints to average (0=disabled)")
+parser.add_argument("--logit-avg", type=int, default=0,
+                    help="Number of late checkpoints for logit/probability averaging (0=disabled)")
 parser.add_argument("--logit-avg-dir", type=str, default="logit_avg_ckpts",
                     help="Directory to save/load epoch checkpoints for logit averaging")
 parser.add_argument("--logit-avg-mode", type=str, default="both",
@@ -72,6 +82,36 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
+parser.add_argument("--logit-cap", type=float, default=10.0,
+                    help="Logit soft-capping value (0=disabled)")
+parser.add_argument("--eval-tokens", type=int, default=10_000_000,
+                    help="Number of validation tokens to evaluate")
+parser.add_argument("--eval-interval-epochs", type=int, default=1,
+                    help="Evaluate every N epoch boundaries (0 = skip intermediate evals)")
+parser.add_argument("--skip-initial-eval", action="store_true",
+                    help="Skip the initial validation pass before training")
+parser.add_argument("--max-steps", type=int, default=0,
+                    help="Stop after this many optimizer steps (0=disabled)")
+parser.add_argument("--interp-layers", type=str, default="",
+                    help="Comma-separated layers that use the frozen trace interpreter branch")
+parser.add_argument("--interp-slots", type=int, default=16,
+                    help="Number of frozen interpreter memory slots")
+parser.add_argument("--interp-memory-dim", type=int, default=128,
+                    help="Value width for the frozen interpreter memory")
+parser.add_argument("--interp-counter-dim", type=int, default=32,
+                    help="Counter width for the frozen interpreter state")
+parser.add_argument("--interp-temperature", type=float, default=1.0,
+                    help="Slot-routing temperature for the frozen interpreter controller")
+parser.add_argument("--interp-counter-scale", type=float, default=0.25,
+                    help="Scale for frozen interpreter counter deltas")
+parser.add_argument("--interp-soft-slots", action="store_true",
+                    help="Use soft slot routing instead of straight-through one-hot slots")
+parser.add_argument("--interp-lr", type=float, default=None,
+                    help="Override AdamW learning rate for interpreter controller params")
+parser.add_argument("--interp-weight-decay", type=float, default=0.0,
+                    help="Weight decay for interpreter controller params")
+parser.add_argument("--ema-blend-alphas", type=str, default="0.7",
+                    help="Comma-separated final-weight blend coefficients used for EMA evaluation")
 args = parser.parse_args()
 
 # Resolve output path
@@ -90,7 +130,7 @@ HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
-EVAL_TOKENS = 10_000_000
+EVAL_TOKENS = args.eval_tokens
 DATA_DIR = "fineweb_data"
 
 # Base optimizer hyperparameters
@@ -105,6 +145,8 @@ MATRIX_LR = BASE_MATRIX_LR * _lr_mult
 UNEMBEDDING_LR = BASE_UNEMBEDDING_LR * _lr_mult
 EMBEDDING_LR = BASE_EMBEDDING_LR * _lr_mult
 SCALAR_LR = BASE_SCALAR_LR * _lr_mult
+INTERP_LR = args.interp_lr if args.interp_lr is not None else SCALAR_LR
+INTERP_WEIGHT_DECAY = args.interp_weight_decay
 
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
@@ -126,12 +168,76 @@ def print0(s="", **kwargs):
     if int(os.environ.get('RANK', 0)) == 0:
         print(s, **kwargs)
 
+
+def parse_layer_spec(spec):
+    if not spec:
+        return tuple()
+    layers = []
+    for item in spec.split(","):
+        item = item.strip()
+        if item:
+            layers.append(int(item))
+    return tuple(sorted(set(layers)))
+
+
+INTERP_LAYERS = parse_layer_spec(args.interp_layers)
+
+
+def parse_float_spec(spec):
+    if not spec:
+        return tuple()
+    values = []
+    for item in spec.split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    return tuple(values)
+
+
+EMA_BLEND_ALPHAS = parse_float_spec(args.ema_blend_alphas)
+
 class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
 
 # =============================================================================
+# EMA (Exponential Moving Average) for weight averaging
+# =============================================================================
+
+class EMATracker:
+    """Maintains EMA shadow weights on CPU for memory efficiency."""
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {name: p.data.float().cpu().clone() for name, p in model.named_parameters()}
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        d = self.decay
+        for name, p in model.named_parameters():
+            self.shadow[name].lerp_(p.data.float().cpu(), 1 - d)
+
+    def apply_to(self, model):
+        """Copy EMA weights into model (for evaluation)."""
+        for name, p in model.named_parameters():
+            p.data.copy_(self.shadow[name].to(p.device, dtype=p.dtype))
+
+    def state_dict(self):
+        return dict(self.shadow)
+
+
+def average_checkpoints(checkpoints):
+    """Average a list of state_dicts (on CPU)."""
+    avg = {}
+    n = len(checkpoints)
+    for key in checkpoints[0]:
+        stacked = torch.stack([ckpt[key].float() for ckpt in checkpoints])
+        avg[key] = stacked.mean(dim=0)
+    return avg
+
+
 def load_state_dict_into_model(model, state_dict):
     """Load a state dict into model, handling dtype conversion."""
     for name, p in model.named_parameters():
@@ -177,6 +283,13 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
+    interp_layers: tuple[int, ...] = ()
+    interp_slots: int = 16
+    interp_memory_dim: int = 128
+    interp_counter_dim: int = 32
+    interp_temperature: float = 1.0
+    interp_hard_slots: bool = True
+    interp_counter_scale: float = 0.25
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -246,10 +359,24 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.interpreter = None
+        if layer_idx in config.interp_layers:
+            self.interpreter = FrozenTraceInterpreter(
+                model_dim=config.n_embd,
+                num_slots=config.interp_slots,
+                memory_dim=config.interp_memory_dim,
+                counter_dim=config.interp_counter_dim,
+                dropout=config.dropout,
+                temperature=config.interp_temperature,
+                hard_slots=config.interp_hard_slots,
+                counter_scale=config.interp_counter_scale,
+            )
 
     def forward(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
         x = x + self.mlp(norm(x))
+        if self.interpreter is not None:
+            x = x + self.interpreter(norm(x))
         return x
 
 
@@ -334,27 +461,24 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def _avg_causal_attended_keys(self, window, seq_len):
-        if window < 0 or window >= seq_len - 1:
-            return (seq_len + 1) / 2
-        max_keys = min(window + 1, seq_len)
-        return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
-
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embedding lookup + elementwise scalars
-        nparams_exclude = (self.transformer.wte.weight.numel()
-                          + self.resid_lambdas.numel()
-                          + self.x0_lambdas.numel()
-                          + self.skip_weights.numel())
+        ve_numel = sum(p.weight.numel() for p in self.ve_projs.values())
+        nparams_exclude = self.transformer.wte.weight.numel() + ve_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        matrix_params = []
+        nonmatrix_params = []
+        for block in self.transformer.h:
+            matrix_params.extend([p for p in block.attn.parameters() if p.ndim >= 2])
+            matrix_params.extend([p for p in block.mlp.parameters() if p.ndim >= 2])
+            if block.interpreter is not None:
+                nonmatrix_params.extend(list(block.interpreter.parameters()))
+        matrix_params.extend(list(self.ve_projs.parameters()))
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -366,6 +490,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=nonmatrix_params, lr=INTERP_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=INTERP_WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
@@ -508,7 +633,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
         infos = {}
         for p in group['params']:
             grad = p.grad
-            if p.numel() < 1024:
+            if grad is None:
+                continue
+            if p.numel() < 1024 or p.ndim == 0 or p.shape[0] % world_size != 0:
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
@@ -520,7 +647,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
         return dict(param_infos=infos)
 
     def _reduce_muon(self, group, world_size):
-        params = group['params']
+        params = [p for p in group['params'] if p.grad is not None]
+        if not params:
+            return dict(params=[], empty=True)
         chunk_size = (len(params) + world_size - 1) // world_size
         padded = chunk_size * world_size
         p = params[0]
@@ -531,10 +660,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
             stacked_grads[len(params):].zero_()
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size, params=params)
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
         for p in group['params']:
+            if p not in info['param_infos']:
+                continue
             pinfo = info['param_infos'][p]
             pinfo['future'].wait()
             state = self.state[p]
@@ -562,8 +693,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group, info, gather_list, rank):
+        if info.get("empty"):
+            return
         info['future'].wait()
-        params = group['params']
+        params = info['params']
         chunk_size = info['chunk_size']
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
@@ -701,16 +834,10 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 
 @torch.no_grad()
 def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
-    """Evaluate using probability averaging across checkpoints (proper ensemble).
-
-    Loads each checkpoint from disk once, runs all val batches for it, then
-    moves to the next — one CPU->GPU weight transfer per checkpoint, not per batch.
-    Accumulates running scalar totals instead of per-token tensors.
-    """
+    """Evaluate using probability averaging across checkpoints."""
     dev = orig_model.get_device()
-    V   = orig_model.config.vocab_size
+    vocab_size = orig_model.config.vocab_size
 
-    # Pre-fetch all val batches to CPU (token ids, tiny ~10 MB)
     val_loader = build_val_loader()
     all_x, all_y = [], []
     for _ in range(steps):
@@ -718,14 +845,10 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
         all_x.append(x.cpu())
         all_y.append(y.cpu())
 
-    BT = all_y[0].numel()
+    flat_batch_tokens = all_y[0].numel()
+    batch_target_probs = torch.zeros(steps, flat_batch_tokens, dtype=torch.float32, device=dev)
 
-    # Per-batch accumulated weighted target probs, kept on GPU
-    # Shape: (steps, BT) — only target-token probs, not full vocab
-    batch_target_probs = torch.zeros(steps, BT, dtype=torch.float32, device=dev)
-
-    # Checkpoint-outer, batch-inner: each checkpoint loaded exactly once
-    for path, w in zip(ckpt_paths, weights):
+    for path, weight in zip(ckpt_paths, weights):
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
         load_state_dict_into_model(orig_model, ckpt)
         del ckpt
@@ -733,14 +856,13 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
             y_flat = y.view(-1).to(dev)
             with autocast_ctx:
                 logits = eval_model(x.to(dev))
-            probs = torch.softmax(logits.view(BT, V).float(), dim=-1)
-            tgt   = probs[torch.arange(BT, device=dev), y_flat.clamp_min(0)]
-            batch_target_probs[i].add_(tgt, alpha=w)
+            probs = torch.softmax(logits.view(flat_batch_tokens, vocab_size).float(), dim=-1)
+            tgt = probs[torch.arange(flat_batch_tokens, device=dev), y_flat.clamp_min(0)]
+            batch_target_probs[i].add_(tgt, alpha=weight)
 
-    # Compute metrics from accumulated target probs using running totals
-    total_nats   = torch.tensor(0.0, dtype=torch.float64, device=dev)
-    total_bytes  = torch.tensor(0, dtype=torch.int64, device=dev)
-    total_loss   = torch.tensor(0.0, dtype=torch.float64, device=dev)
+    total_nats = torch.tensor(0.0, dtype=torch.float64, device=dev)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=dev)
+    total_loss = torch.tensor(0.0, dtype=torch.float64, device=dev)
     total_tokens = torch.tensor(0, dtype=torch.int64, device=dev)
 
     for i, y in enumerate(all_y):
@@ -749,21 +871,21 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
         log_probs = batch_target_probs[i].clamp_min(1e-40).log()
         num_bytes_batch = token_bytes[y_flat.clamp_min(0)]
 
-        total_nats   += (log_probs.neg() * (num_bytes_batch > 0)).sum().double()
-        total_bytes  += num_bytes_batch.sum()
-        total_loss   += log_probs[mask].neg().sum().double()
+        total_nats += (log_probs.neg() * (num_bytes_batch > 0)).sum().double()
+        total_bytes += num_bytes_batch.sum()
+        total_loss += log_probs[mask].neg().sum().double()
         total_tokens += mask.sum()
 
     del batch_target_probs
 
     if dist.is_initialized():
-        dist.all_reduce(total_nats,   op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_bytes,  op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_loss,   op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
 
-    bpb  = total_nats.item()  / (math.log(2) * total_bytes.item())  if total_bytes.item()  > 0 else float('inf')
-    loss = total_loss.item()  / total_tokens.item()                  if total_tokens.item() > 0 else float('inf')
+    bpb = total_nats.item() / (math.log(2) * total_bytes.item()) if total_bytes.item() > 0 else float('inf')
+    loss = total_loss.item() / total_tokens.item() if total_tokens.item() > 0 else float('inf')
     return bpb, loss
 
 # =============================================================================
@@ -822,6 +944,15 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  eval_interval_epochs={args.eval_interval_epochs}, skip_initial_eval={args.skip_initial_eval}")
+if args.logit_avg > 0 or args.eval_logit_avg:
+    print0(f"  logit_avg={args.logit_avg}, logit_avg_mode={args.logit_avg_mode}, logit_avg_dir={args.logit_avg_dir}")
+if INTERP_LAYERS:
+    print0(f"  frozen_interpreter_layers={INTERP_LAYERS}, slots={args.interp_slots}, mem_dim={args.interp_memory_dim}, counter_dim={args.interp_counter_dim}")
+    print0(f"  frozen_interpreter_temperature={args.interp_temperature}, hard_slots={not args.interp_soft_slots}, counter_scale={args.interp_counter_scale}")
+    print0(f"  frozen_interpreter_optimizer: lr={INTERP_LR}, weight_decay={INTERP_WEIGHT_DECAY}")
+if EMA_BLEND_ALPHAS:
+    print0(f"  ema_blend_alphas={EMA_BLEND_ALPHAS}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -839,7 +970,17 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(
+    vocab_size=vocab_size,
+    dropout=args.dropout,
+    interp_layers=INTERP_LAYERS,
+    interp_slots=args.interp_slots,
+    interp_memory_dim=args.interp_memory_dim,
+    interp_counter_dim=args.interp_counter_dim,
+    interp_temperature=args.interp_temperature,
+    interp_hard_slots=not args.interp_soft_slots,
+    interp_counter_scale=args.interp_counter_scale,
+)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -877,6 +1018,8 @@ num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  #
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
+if args.max_steps > 0:
+    print0(f"Max optimizer steps: {args.max_steps}")
 
 # Schedulers
 def get_lr_multiplier(it):
@@ -900,20 +1043,32 @@ smooth_train_loss = 0
 total_training_time = 0
 timed_steps = 0
 timing_start_step = 4  # skip first compile + 3 warmup steps
-eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+eval_steps = max(1, EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size))
 dupe_active = False
+last_eval_step = -1
 
+# EMA and checkpoint averaging setup
+ema_decays = [float(d) for d in args.ema_decays.split(",") if d.strip()] if args.ema_decays else []
+ema_start_step = round(args.ema_start_frac * num_iterations)
+ema_trackers = []  # initialized lazily at ema_start_step
+ema_initialized = False
+late_checkpoints = []  # list of state_dicts (on CPU) for checkpoint averaging
+checkpoint_avg_count = args.checkpoint_avg
 late_checkpoint_paths = []  # paths to saved epoch checkpoints for logit averaging
 logit_avg_count = args.logit_avg
+if ema_decays:
+    print0(f"EMA decays: {ema_decays}, starting at step {ema_start_step} ({args.ema_start_frac*100:.0f}% of training)")
+if checkpoint_avg_count > 0:
+    print0(f"Checkpoint averaging: will keep last {checkpoint_avg_count} epoch checkpoints")
 if logit_avg_count > 0 and master_process:
     os.makedirs(args.logit_avg_dir, exist_ok=True)
 if logit_avg_count > 0:
     print0(f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/")
 
+# Initial val evaluation
 if args.eval_logit_avg:
     print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
-else:
-    # Initial val evaluation
+elif not args.skip_initial_eval:
     model.eval()
     val_loader = build_val_loader()
     with autocast_ctx:
@@ -922,9 +1077,15 @@ else:
     wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
     min_val_bpb = val_bpb
     min_val_loss = val_loss
+    last_eval_step = step
     model.train()
+else:
+    print0("Skipping initial validation pass")
 
 while not args.eval_logit_avg and current_epoch <= args.num_epochs:
+    if args.max_steps > 0 and step >= args.max_steps:
+        print0(f"Stopping early at max_steps={args.max_steps}")
+        break
     if not dupe_active and current_epoch >= args.dupe_start_epoch:
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops)
@@ -958,6 +1119,18 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 
     step += 1
 
+    if args.max_steps > 0 and step >= args.max_steps:
+        current_epoch = args.num_epochs + 1
+
+    # EMA update (every 10 steps to minimize CPU copy overhead)
+    if ema_decays and step >= ema_start_step and step % 10 == 0:
+        if not ema_initialized:
+            print0(f"Initializing {len(ema_decays)} EMA tracker(s) at step {step}")
+            ema_trackers = [EMATracker(orig_model, d) for d in ema_decays]
+            ema_initialized = True
+        for ema in ema_trackers:
+            ema.update(orig_model)
+
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
@@ -981,23 +1154,36 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 
     # Epoch boundary: evaluate when the dataloader advances to a new epoch
     if epoch != current_epoch:
-        model.eval()
-        val_loader = build_val_loader()
-        with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
-        # Early stopping
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-            min_val_loss = val_loss
-            epochs_without_improvement = 0
+        should_eval = args.eval_interval_epochs > 0 and (current_epoch % args.eval_interval_epochs == 0)
+        if should_eval:
+            model.eval()
+            val_loader = build_val_loader()
+            with autocast_ctx:
+                val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+            wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+            last_eval_step = step
+            # Early stopping
+            if val_bpb < min_val_bpb:
+                min_val_bpb = val_bpb
+                min_val_loss = val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if args.patience >= 0 and epochs_without_improvement >= args.patience:
+                    print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
+                    break
+            # Save checkpoint for late averaging
+            if checkpoint_avg_count > 0 and step >= ema_start_step:
+                ckpt = {name: p.data.float().cpu().clone() for name, p in orig_model.named_parameters()}
+                late_checkpoints.append(ckpt)
+                if len(late_checkpoints) > checkpoint_avg_count:
+                    late_checkpoints.pop(0)
+                print0(f"  Saved checkpoint for averaging ({len(late_checkpoints)}/{checkpoint_avg_count})")
+
+            model.train()
         else:
-            epochs_without_improvement += 1
-            if args.patience >= 0 and epochs_without_improvement >= args.patience:
-                print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
-                break
-        # Save checkpoint to disk for logit averaging
+            print0(f"Step {step:05d} | Epoch {current_epoch} | Skipping val eval")
         if logit_avg_count > 0:
             ckpt_path = os.path.join(args.logit_avg_dir, f"epoch_{current_epoch:03d}.pt")
             if master_process:
@@ -1010,8 +1196,6 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
                 if master_process and os.path.exists(old):
                     os.remove(old)
             print0(f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})")
-
-        model.train()
         # Update num_iterations estimate now that we know real steps per epoch
         # steps_per_epoch = step // current_epoch
         # num_iterations = steps_per_epoch * args.num_epochs
@@ -1023,12 +1207,62 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         gc.collect(); gc.freeze(); gc.disable()
 
 # =============================================================================
-# Post-training: evaluate checkpoint averages
+# Post-training: evaluate EMA and checkpoint averages
 # =============================================================================
+
+if not args.eval_logit_avg and step > 0 and last_eval_step != step:
+    model.eval()
+    val_loader = build_val_loader()
+    with autocast_ctx:
+        val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    print0(f"Step {step:05d} | Final | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+    wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+    if val_loss < min_val_loss:
+        min_val_loss = val_loss
+        min_val_bpb = val_bpb
+    model.train()
+
+# Save the original (final) model weights so we can restore after EMA eval
+if not args.eval_logit_avg and (ema_trackers or late_checkpoints):
+    final_weights = {name: p.data.clone() for name, p in orig_model.named_parameters()}
+
+# Evaluate EMA blend(s)
+for i, ema in enumerate(ema_trackers if not args.eval_logit_avg else []):
+    print0(f"\n--- Evaluating EMA blend (decay={ema.decay}, {ema.num_updates} updates) ---")
+    for alpha in EMA_BLEND_ALPHAS:
+        for name, p in orig_model.named_parameters():
+            blended = alpha * final_weights[name] + (1 - alpha) * ema.shadow[name].to(final_weights[name].device, dtype=final_weights[name].dtype)
+            p.data.copy_(blended.to(p.device, dtype=p.dtype))
+        model.eval()
+        val_loader = build_val_loader()
+        with autocast_ctx:
+            blend_bpb, blend_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Blend({alpha:.2f}*final+{1-alpha:.2f}*EMA {ema.decay}): Val BPB: {blend_bpb:.6f} | Val Loss: {blend_loss:.6f}")
+        if blend_loss < min_val_loss:
+            min_val_loss = blend_loss
+            min_val_bpb = blend_bpb
+            print0(f"  ** New best! (from blend {alpha:.2f}/{1-alpha:.2f} with EMA {ema.decay})")
+        load_state_dict_into_model(orig_model, final_weights)
+
+# Evaluate checkpoint average
+if not args.eval_logit_avg and len(late_checkpoints) >= 2:
+    print0(f"\n--- Evaluating checkpoint average ({len(late_checkpoints)} checkpoints) ---")
+    avg_sd = average_checkpoints(late_checkpoints)
+    load_state_dict_into_model(orig_model, avg_sd)
+    model.eval()
+    val_loader = build_val_loader()
+    with autocast_ctx:
+        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    print0(f"Checkpoint avg: Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
+    if avg_loss < min_val_loss:
+        min_val_loss = avg_loss
+        min_val_bpb = avg_bpb
+        print0(f"  ** New best! (from checkpoint averaging)")
+    # Restore original weights
+    load_state_dict_into_model(orig_model, final_weights)
 
 # Evaluate logit (probability) average
 if logit_avg_count > 0:
-    # In eval-only mode, discover checkpoints from disk; otherwise use what was saved during training
     if args.eval_logit_avg:
         import glob as _glob
         all_disk = sorted(_glob.glob(os.path.join(args.logit_avg_dir, "epoch_*.pt")))
@@ -1039,8 +1273,7 @@ if logit_avg_count > 0:
     if len(ckpt_paths_for_logit) >= 2:
         n = len(ckpt_paths_for_logit)
         print0(f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---")
-
-        la_model = torch.compile(orig_model, dynamic=False)
+        la_model = model
         la_model.eval()
 
         def _run_mode(label, weights):
@@ -1050,22 +1283,23 @@ if logit_avg_count > 0:
             wandb_run.log({f"logit_avg_{label}/bpb": bpb, f"logit_avg_{label}/loss": loss})
             return bpb, loss
 
-        equal_w    = [1.0 / n] * n
-        raw_w      = list(range(1, n + 1))
+        equal_w = [1.0 / n] * n
+        raw_w = list(range(1, n + 1))
         weighted_w = [w / sum(raw_w) for w in raw_w]
 
         if args.logit_avg_mode in ("equal", "both"):
             eq_bpb, eq_loss = _run_mode("equal", equal_w)
             if eq_loss < min_val_loss:
                 min_val_loss, min_val_bpb = eq_loss, eq_bpb
-                print0(f"  ** New best! (logit avg equal weights)")
+                print0("  ** New best! (logit avg equal weights)")
 
         if args.logit_avg_mode in ("weighted", "both"):
             wt_bpb, wt_loss = _run_mode("weighted", weighted_w)
             if wt_loss < min_val_loss:
                 min_val_loss, min_val_bpb = wt_loss, wt_bpb
-                print0(f"  ** New best! (logit avg recency weights)")
-
+                print0("  ** New best! (logit avg recency weights)")
+    elif args.eval_logit_avg:
+        print0("Not enough checkpoints found for logit averaging")
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
