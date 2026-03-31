@@ -729,10 +729,10 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 @torch.no_grad()
 def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocast_ctx):
     """
-    Compute ensemble val loss by averaging logits across all checkpoints.
+    Compute ensemble val loss by averaging probabilities across all checkpoints.
 
-    For N models, the ensemble prediction is: softmax(mean(logits_1, ..., logits_N))
-    Loss is computed from these averaged logits against the ground truth targets.
+    For N models, the ensemble prediction is: mean(softmax(logits_1), ..., softmax(logits_N))
+    Loss is computed as -log(avg_prob[target]).
     """
     num_models = len(checkpoint_paths)
     print0(f"  Loading {num_models} model(s) into GPU memory...")
@@ -768,33 +768,30 @@ def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocas
     batch_iter = iter(val_loader)
     for _ in range(ensemble_eval_steps):
         x, y, _ = next(batch_iter)
+        flat_y = y.view(-1)
 
-        # Average logits across all models
-        logits_sum = None
+        # Average target probabilities across all models
+        target_prob_sum = torch.zeros(flat_y.size(0), dtype=torch.float64, device=device)
         for model in ensemble_models:
             with autocast_ctx:
                 logits = model.forward_logits(x).float()
-            if logits_sum is None:
-                logits_sum = logits
-            else:
-                logits_sum.add_(logits)
-            del logits
-        avg_logits = logits_sum / num_models
+            probs = F.softmax(logits.view(-1, logits.size(-1)), dim=-1)
+            target_prob_sum += probs.gather(1, flat_y.clamp(min=0).unsqueeze(-1)).squeeze(-1).double()
+            del logits, probs
+        avg_prob = target_prob_sum / num_models
 
-        # Compute loss from the averaged logits
-        flat_logits = avg_logits.view(-1, avg_logits.size(-1))
-        flat_y = y.view(-1)
-        loss2d = F.cross_entropy(flat_logits, flat_y, ignore_index=-1, reduction='none')
+        # Compute loss as -log(avg_prob)
+        loss_per_pos = -torch.log(avg_prob + 1e-10)
 
         mask = flat_y != -1
-        total_loss += loss2d[mask].sum().double()
+        total_loss += loss_per_pos[mask].sum()
         total_tokens += mask.sum()
 
-        num_bytes2d = token_bytes[flat_y]
-        total_nats += (loss2d * (num_bytes2d > 0)).sum().double()
-        total_bytes += num_bytes2d.sum()
+        num_bytes2d = token_bytes[flat_y.clamp(min=0)]
+        total_nats += (loss_per_pos[mask] * (num_bytes2d[mask] > 0).double()).sum()
+        total_bytes += num_bytes2d[mask].sum()
 
-        del logits_sum, avg_logits
+        del target_prob_sum, avg_prob
 
     # Cleanup all models
     del ensemble_models
