@@ -65,7 +65,7 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--num-models", type=int, default=10, help="Number of ensemble members")
+parser.add_argument("--num-models", type=int, default=20, help="Number of ensemble members")
 parser.add_argument("--checkpoint-base", type=str, default="checkpoints", help="Base directory for checkpoints")
 parser.add_argument("--resume", type=str, default=None, help="Run ID to resume from (e.g. 20250226_143000)")
 parser.add_argument("--distill-alpha", type=float, default=0.7, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
@@ -1373,12 +1373,14 @@ def main():
         individual_results.append({"model": model_idx + 1, "seed": seeds[model_idx],
                                     "val_bpb": best_bpb, "val_loss": best_loss})
 
-        # Compute ensemble val loss (for k=1, just use individual; for k>=2, average logits)
+        # Compute ensemble val loss using last 7 models (7 * ~7GB = ~49GB fits in 80GB GPU)
         num_models_so_far = model_idx + 1
-        print0(f"\nEvaluating ensemble of {num_models_so_far} model(s)...")
+        max_ensemble_gpu = 7
+        eval_paths = checkpoint_paths[-max_ensemble_gpu:] if len(checkpoint_paths) > max_ensemble_gpu else checkpoint_paths
+        print0(f"\nEvaluating ensemble of {len(eval_paths)} model(s) (of {num_models_so_far} total)...")
 
         ens_bpb, ens_loss = evaluate_ensemble_bpb(
-            checkpoint_paths=checkpoint_paths,
+            checkpoint_paths=eval_paths,
             config=config,
             token_bytes=token_bytes,
             device=device,
@@ -1397,8 +1399,11 @@ def main():
         # Ensemble excluding model 0 — this is the reported ensemble metric,
         # since model 0 (no distillation teacher, fewer epochs) hurts ensemble quality.
         if len(checkpoint_paths) >= 2:
+            nf_paths = checkpoint_paths[1:]
+            if len(nf_paths) > max_ensemble_gpu:
+                nf_paths = nf_paths[-max_ensemble_gpu:]
             ens_nf_bpb, ens_nf_loss = evaluate_ensemble_bpb(
-                checkpoint_paths=checkpoint_paths[1:],
+                checkpoint_paths=nf_paths,
                 config=config,
                 token_bytes=token_bytes,
                 device=device,
@@ -1412,6 +1417,21 @@ def main():
                 "ensemble_no_first/val_loss": ens_nf_loss,
             })
 
+    # Final ensemble evaluation: last 7 models (prob averaging)
+    max_ensemble_gpu = 7
+    final_paths = checkpoint_paths[-max_ensemble_gpu:]
+    print0(f"\n{'='*60}")
+    print0(f"Final ensemble eval: last {len(final_paths)} models (prob averaging)")
+    print0(f"{'='*60}")
+    final_bpb, final_loss = evaluate_ensemble_bpb(
+        checkpoint_paths=final_paths,
+        config=config,
+        token_bytes=token_bytes,
+        device=device,
+        autocast_ctx=autocast_ctx,
+    )
+    print0(f"  Val BPB: {final_bpb:.6f} | Val Loss: {final_loss:.6f}")
+
     # Final summary
     print0(f"\n{'='*60}")
     print0(f"Ensemble Training Complete")
@@ -1422,14 +1442,15 @@ def main():
     print0(f"\nRunning ensemble results:")
     for r in ensemble_results:
         print0(f"  Ensemble ({r['num_models']} models): BPB={r['ensemble_bpb']:.6f}, Loss={r['ensemble_loss']:.6f}")
+    print0(f"\n*** Final result (last {len(final_paths)} models, prob avg): BPB={final_bpb:.6f} | Val Loss={final_loss:.6f} ***")
 
     # Save results
     if args.save_result and master_process:
         result = {
             "individual_models": individual_results,
             "ensemble_results": ensemble_results,
-            "final_ensemble_bpb": ensemble_results[-1]["ensemble_bpb"],
-            "final_ensemble_loss": ensemble_results[-1]["ensemble_loss"],
+            "final_ensemble_bpb": final_bpb,
+            "final_ensemble_loss": final_loss,
         }
         with open(args.save_result, "w") as f:
             json.dump(result, f, indent=2)
