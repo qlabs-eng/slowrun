@@ -6,11 +6,10 @@ Usage:
    torchrun --standalone --nproc_per_node=8 train.py --gdn-layers "1,3,5,7,9,11,13,16,18,20,22,24,26,28"
    Performance reference (8×H100, 12 epochs, alternating-14 layout):
       Config: --gdn-layers 1,3,5,6,8,10,11,13,15,16,18,20,22,23 (14 GDN / 16 softmax)
-      Val loss: 3.2458 (baseline 3.2526, Δ = −0.0068)
-      Val BPB:  1.0548 (baseline 1.0570)
-      Training time: 80.78 min (baseline 58.51 min, +38%)
-      Wall time: 85.77 min
-      Per-layer GDN cost: ~42 ms/step (unoptimised, with conv)
+      Min val BPB: 1.053290                                                                                                                    
+      Min val Loss: 3.241282 
+      Total training time: 72.33m                                                                                                                                                              json                                       
+      Total wall time: 4614.82s (76.91m)     
 """
 
 import os
@@ -37,6 +36,14 @@ import tiktoken
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 _script_start = time.time()
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _first_existing_path(candidates):
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
 
 # =============================================================================
 # CLI arguments
@@ -81,6 +88,12 @@ parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
 parser.add_argument("--gdn-layers", type=str, default="auto",
                     help="Comma-separated layer indices for GatedDeltaNet, or 'auto' for all-but-first-last-every-7th, or 'none'")
+parser.add_argument("--gdn-no-conv", action="store_true",
+                    help="Disable GDN short convolutions and use the projection-only fast path")
+parser.add_argument("--gdn-use-recurrent", action="store_true",
+                    help="Use the experimental fused recurrent GDN kernel instead of chunked mode")
+parser.add_argument("--gdn-profile", action="store_true",
+                    help="Enable lightweight GDN timing attribution (runs in eager mode)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -100,7 +113,10 @@ MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
-DATA_DIR = "fineweb_data"
+DATA_DIR = _first_existing_path([
+    os.path.abspath(os.path.join(_THIS_DIR, "..", "..", "fineweb_data")),
+    os.path.abspath(os.path.join(_THIS_DIR, "..", "..", "..", "fineweb_data")),
+])
 
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
@@ -139,6 +155,63 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
+
+
+class GDNProfiler:
+    def __init__(self, enabled=False, synchronize_fn=None):
+        self.enabled = enabled
+        self._synchronize = synchronize_fn or (lambda: None)
+        self._stats = {}
+
+    class _Section:
+        def __init__(self, profiler, name):
+            self.profiler = profiler
+            self.name = name
+            self.start = None
+
+        def __enter__(self):
+            self.profiler._synchronize()
+            self.start = time.perf_counter()
+
+        def __exit__(self, exc_type, exc, tb):
+            self.profiler._synchronize()
+            self.profiler.add(self.name, time.perf_counter() - self.start)
+
+    def section(self, name):
+        return self._Section(self, name) if self.enabled else nullcontext()
+
+    def add(self, name, dt):
+        stats = self._stats.setdefault(name, {"time": 0.0, "count": 0})
+        stats["time"] += dt
+        stats["count"] += 1
+
+    def summary_lines(self):
+        total = sum(stats["time"] for stats in self._stats.values())
+        if total <= 0:
+            return []
+        lines = []
+        for name, stats in sorted(self._stats.items(), key=lambda item: item[1]["time"], reverse=True):
+            mean_ms = 1000.0 * stats["time"] / max(stats["count"], 1)
+            pct = 100.0 * stats["time"] / total
+            lines.append(f"  {name}: {mean_ms:.2f}ms avg over {stats['count']} calls ({pct:.1f}%)")
+        return lines
+
+    def summary_dict(self):
+        total = sum(stats["time"] for stats in self._stats.values())
+        if total <= 0:
+            return {}
+        summary = {}
+        for name, stats in self._stats.items():
+            summary[name] = {
+                "total_sec": stats["time"],
+                "count": stats["count"],
+                "avg_ms": 1000.0 * stats["time"] / max(stats["count"], 1),
+                "pct_total": 100.0 * stats["time"] / total,
+            }
+        return summary
+
+
+gdn_profiler = GDNProfiler()
 
 # =============================================================================
 # EMA (Exponential Moving Average) for weight averaging
@@ -223,6 +296,9 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
     gdn_layers: list = None  # layer indices that use GatedDeltaNet (None = all softmax)
+    gdn_no_conv: bool = False
+    gdn_use_recurrent: bool = False
+    gdn_profile: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -290,12 +366,14 @@ class GatedDeltaNetAttention(nn.Module):
         self.key_dim = self.num_heads * self.head_k_dim          # 896
         self.value_dim = self.num_heads * self.head_v_dim        # 1792
         self.layer_idx = layer_idx
+        self.use_short_conv = not config.gdn_no_conv
+        self.use_recurrent = config.gdn_use_recurrent
+        self._recurrent_fallback_warned = False
+        self.recurrent_fallback_count = 0
 
         # Projections (~4*d^2 total)
-        self.q_proj = nn.Linear(config.n_embd, self.key_dim, bias=False)
-        self.k_proj = nn.Linear(config.n_embd, self.key_dim, bias=False)
-        self.v_proj = nn.Linear(config.n_embd, self.value_dim, bias=False)
-        self.g_proj = nn.Linear(config.n_embd, self.value_dim, bias=False)  # output gate
+        self.qk_proj = nn.Linear(config.n_embd, 2 * self.key_dim, bias=False)
+        self.vg_proj = nn.Linear(config.n_embd, 2 * self.value_dim, bias=False)
         self.o_proj = nn.Linear(self.value_dim, config.n_embd, bias=False)
 
         # Delta rule: beta (write strength) and forget gate projections
@@ -326,27 +404,63 @@ class GatedDeltaNetAttention(nn.Module):
 
         # Short 1D convolutions on q, k, v (size 4, crucial for performance)
         self.conv_size = 4
-        self.q_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
-                               padding=self.conv_size - 1, groups=self.key_dim, bias=False)
-        self.k_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
-                               padding=self.conv_size - 1, groups=self.key_dim, bias=False)
-        self.v_conv = nn.Conv1d(self.value_dim, self.value_dim, self.conv_size,
-                               padding=self.conv_size - 1, groups=self.value_dim, bias=False)
+        if self.use_short_conv:
+            self.q_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
+                                   padding=self.conv_size - 1, groups=self.key_dim, bias=False)
+            self.k_conv = nn.Conv1d(self.key_dim, self.key_dim, self.conv_size,
+                                   padding=self.conv_size - 1, groups=self.key_dim, bias=False)
+            self.v_conv = nn.Conv1d(self.value_dim, self.value_dim, self.conv_size,
+                                   padding=self.conv_size - 1, groups=self.value_dim, bias=False)
+        else:
+            self.q_conv = None
+            self.k_conv = None
+            self.v_conv = None
 
         self.resid_dropout = nn.Dropout(config.dropout)
+
+    def _apply_short_conv(self, x, conv, T):
+        if conv is None:
+            return F.silu(x)
+        return F.silu(conv(x.transpose(1, 2))[:, :, :T].transpose(1, 2))
+
+    def _run_delta_rule(self, q, k, v, g, beta):
+        kernel_kwargs = dict(
+            q=q,
+            k=k,
+            v=v,
+            g=g.to(q.dtype),
+            beta=beta.to(q.dtype),
+            scale=self.head_k_dim ** -0.5,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        if not self.use_recurrent:
+            result = chunk_gated_delta_rule(**kernel_kwargs)
+        else:
+            try:
+                result = fused_recurrent_gated_delta_rule(**kernel_kwargs)
+            except Exception as exc:
+                self.recurrent_fallback_count += 1
+                if not self._recurrent_fallback_warned:
+                    print0(f"Layer {self.layer_idx}: recurrent GDN kernel failed ({type(exc).__name__}: {exc}); falling back to chunk kernel")
+                    self._recurrent_fallback_warned = True
+                result = chunk_gated_delta_rule(**kernel_kwargs)
+        return result[0] if isinstance(result, tuple) else result
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
 
-        # Project q, k, v
-        q = self.q_proj(x)  # (B, T, key_dim)
-        k = self.k_proj(x)  # (B, T, key_dim)
-        v = self.v_proj(x)  # (B, T, value_dim)
+        with gdn_profiler.section("gdn/proj"):
+            qk = self.qk_proj(x)
+            vg = self.vg_proj(x)
+            q, k = qk.split(self.key_dim, dim=-1)
+            v, g_out = vg.split(self.value_dim, dim=-1)
 
         # Short convolutions + SiLU activation
-        q = F.silu(self.q_conv(q.transpose(1, 2))[:, :, :T].transpose(1, 2))
-        k = F.silu(self.k_conv(k.transpose(1, 2))[:, :, :T].transpose(1, 2))
-        v = F.silu(self.v_conv(v.transpose(1, 2))[:, :, :T].transpose(1, 2))
+        with gdn_profiler.section("gdn/conv"):
+            q = self._apply_short_conv(q, self.q_conv, T)
+            k = self._apply_short_conv(k, self.k_conv, T)
+            v = self._apply_short_conv(v, self.v_conv, T)
 
         # Reshape to heads
         q = q.view(B, T, self.num_heads, self.head_k_dim)
@@ -363,17 +477,13 @@ class GatedDeltaNetAttention(nn.Module):
             self.a_proj(x).float() + self.dt_bias
         )  # (B, T, H)
 
-        # Chunk-wise delta rule kernel
-        o, _ = chunk_gated_delta_rule(
-            q=q, k=k, v=v, g=g.to(q.dtype), beta=beta.to(q.dtype),
-            scale=self.head_k_dim ** -0.5,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-        )  # (B, T, H, head_v_dim)
+        with gdn_profiler.section("gdn/kernel"):
+            o = self._run_delta_rule(q, k, v, g, beta)
 
         # Output gate: gated RMSNorm
-        g_out = self.g_proj(x).view(B, T, self.num_heads, self.head_v_dim)
-        o = F.rms_norm(o, (self.head_v_dim,)) * F.silu(g_out)
+        with gdn_profiler.section("gdn/output"):
+            g_out = g_out.view(B, T, self.num_heads, self.head_v_dim)
+            o = F.rms_norm(o, (self.head_v_dim,)) * F.silu(g_out)
 
         o = o.reshape(B, T, self.value_dim)
         return self.resid_dropout(self.o_proj(o))
@@ -454,10 +564,8 @@ class GPT(nn.Module):
             if block.is_gdn:
                 # GatedDeltaNet init
                 attn = block.attn
-                torch.nn.init.uniform_(attn.q_proj.weight, -s, s)
-                torch.nn.init.uniform_(attn.k_proj.weight, -s, s)
-                torch.nn.init.uniform_(attn.v_proj.weight, -s, s)
-                torch.nn.init.uniform_(attn.g_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.qk_proj.weight, -s, s)
+                torch.nn.init.uniform_(attn.vg_proj.weight, -s, s)
                 torch.nn.init.zeros_(attn.o_proj.weight)
                 torch.nn.init.uniform_(attn.a_proj.weight, -s, s)
                 torch.nn.init.uniform_(attn.b_proj.weight, -s, s)
@@ -473,7 +581,8 @@ class GPT(nn.Module):
                 attn.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
                 # Conv weights: normal init
                 for conv in [attn.q_conv, attn.k_conv, attn.v_conv]:
-                    torch.nn.init.normal_(conv.weight, std=0.02)
+                    if conv is not None:
+                        torch.nn.init.normal_(conv.weight, std=0.02)
             else:
                 # Standard attention init
                 torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -526,6 +635,13 @@ class GPT(nn.Module):
         attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
         return 6 * (nparams - nparams_exclude) + attn_flops
 
+    def count_gdn_recurrent_fallbacks(self):
+        count = 0
+        for block in self.transformer.h:
+            if block.is_gdn:
+                count += block.attn.recurrent_fallback_count
+        return count
+
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
         # Collect GDN scalar params (A_log, dt_bias, conv weights) separately
@@ -541,9 +657,10 @@ class GPT(nn.Module):
                     gdn_scalar_ids.add(id(block.attn.b_proj.bias))
                     gdn_scalar_params.append(block.attn.b_proj.bias)
                 for conv in [block.attn.q_conv, block.attn.k_conv, block.attn.v_conv]:
-                    for p in conv.parameters():
-                        gdn_scalar_ids.add(id(p))
-                        gdn_scalar_params.append(p)
+                    if conv is not None:
+                        for p in conv.parameters():
+                            gdn_scalar_ids.add(id(p))
+                            gdn_scalar_params.append(p)
         matrix_params = [p for p in list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
                          if id(p) not in gdn_scalar_ids]
         ve_params = []
@@ -915,6 +1032,7 @@ device_type = device.type
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+gdn_profiler = GDNProfiler(enabled=args.gdn_profile, synchronize_fn=synchronize)
 
 # GPU info for MFU
 gpu_peak_flops = float('inf')
@@ -949,7 +1067,49 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  gdn_no_conv={args.gdn_no_conv}, gdn_use_recurrent={args.gdn_use_recurrent}, gdn_profile={args.gdn_profile}")
 print0(f"-----------------------")
+
+if args.gdn_profile:
+    print0("GDN profiling enabled; running in eager mode to keep section timings meaningful")
+if args.gdn_use_recurrent:
+    print0("Experimental recurrent GDN kernel requested; chunk-kernel fallback remains enabled")
+
+def recurrent_gdn_backward_supported():
+    if not args.gdn_use_recurrent:
+        return True, None
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    q = torch.randn(1, 4, 2, 8, device=device, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 4, 2, 8, device=device, dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 4, 2, 12, device=device, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(1, 4, 2, 12, device=device, dtype=torch.bfloat16, requires_grad=True)
+    beta = torch.sigmoid(torch.randn(1, 4, 2, device=device, dtype=torch.float32, requires_grad=True))
+    try:
+        out = fused_recurrent_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta.to(q.dtype),
+            scale=q.shape[-1] ** -0.5,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out = out[0] if isinstance(out, tuple) else out
+        out.float().sum().backward()
+        return True, None
+    except NotImplementedError as exc:
+        return False, str(exc)
+    except Exception:
+        return True, None
+
+if args.gdn_use_recurrent:
+    recurrent_ok, recurrent_error = recurrent_gdn_backward_supported()
+    if not recurrent_ok:
+        raise RuntimeError(
+            "Requested --gdn-use-recurrent, but the installed fla fused recurrent GDN kernel does not support backward in training mode. "
+            f"Upstream error: {recurrent_error}"
+        )
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
 encoder = tiktoken.get_encoding("gpt2")
@@ -984,7 +1144,14 @@ else:
     print0("All layers use standard softmax attention (no GDN)")
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, gdn_layers=gdn_layer_indices)
+config = GPTConfig(
+    vocab_size=vocab_size,
+    dropout=args.dropout,
+    gdn_layers=gdn_layer_indices,
+    gdn_no_conv=args.gdn_no_conv,
+    gdn_use_recurrent=args.gdn_use_recurrent,
+    gdn_profile=args.gdn_profile,
+)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1001,7 +1168,8 @@ print0(f"FLOPs per token: {num_flops_per_token:e}")
 
 # Compile
 orig_model = model
-model = torch.compile(model, dynamic=False)
+compile_enabled = not args.gdn_profile
+model = torch.compile(model, dynamic=False) if compile_enabled else model
 
 # Optimizer
 optimizer = model.setup_optimizer()
@@ -1047,6 +1215,7 @@ timed_steps = 0
 timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 dupe_active = False
+epoch_metrics = []
 
 # EMA and checkpoint averaging setup
 ema_decays = [float(d) for d in args.ema_decays.split(",") if d.strip()] if args.ema_decays else []
@@ -1075,8 +1244,7 @@ while current_epoch <= args.num_epochs:
     if not dupe_active and current_epoch >= args.dupe_start_epoch:
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops)
-        model = torch.compile(orig_model, dynamic=False)
-        # model = orig_model # replace compile with this line for eager mode
+        model = torch.compile(orig_model, dynamic=False) if compile_enabled else orig_model
         dupe_active = True
         timing_start_step = step + 4  # skip dupe recompile + 3 warmup steps
         gc.enable(); gc.collect()
@@ -1097,7 +1265,8 @@ while current_epoch <= args.num_epochs:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
-    optimizer.step()
+    with gdn_profiler.section("optimizer/step"):
+        optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
     synchronize()
@@ -1143,6 +1312,12 @@ while current_epoch <= args.num_epochs:
             val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
         wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+        epoch_metrics.append({
+            "epoch": current_epoch,
+            "step": step,
+            "val_bpb": val_bpb,
+            "val_loss": val_loss,
+        })
         # Early stopping
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -1227,13 +1402,31 @@ print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
+gdn_profile_summary = gdn_profiler.summary_dict() if args.gdn_profile else {}
+gdn_recurrent_fallbacks = orig_model.count_gdn_recurrent_fallbacks()
+avg_timed_step_ms = 1000.0 * total_training_time / timed_steps if timed_steps > 0 else None
+peak_memory_mib = get_max_memory() / 1024 / 1024
+
 if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "input_bin": _train_path,
+        "input_val_bin": _val_path,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
+        "epoch_metrics": epoch_metrics,
+        "avg_timed_step_ms": avg_timed_step_ms,
+        "timed_steps": timed_steps,
+        "total_training_time_min": total_training_time / 60,
+        "total_wall_time_sec": time.time() - _script_start,
+        "peak_memory_mib": peak_memory_mib,
+        "gdn_no_conv": args.gdn_no_conv,
+        "gdn_use_recurrent": args.gdn_use_recurrent,
+        "gdn_profile": args.gdn_profile,
+        "gdn_recurrent_fallbacks": gdn_recurrent_fallbacks,
+        "gdn_profile_summary": gdn_profile_summary,
         "wandb_url": getattr(wandb_run, "url", None),
     }
     with open(args.save_result, "w") as f:
@@ -1242,6 +1435,11 @@ if args.save_result and master_process:
 
 total_wall_time = time.time() - _script_start
 print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
+
+if args.gdn_profile:
+    print0("GDN profile summary:")
+    for line in gdn_profiler.summary_lines():
+        print0(line)
 
 wandb_run.finish()
 if dist.is_initialized():
