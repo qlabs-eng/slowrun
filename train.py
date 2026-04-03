@@ -298,10 +298,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            normal_std = self.config.n_embd ** -0.5
+            torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
