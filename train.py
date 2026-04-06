@@ -257,12 +257,16 @@ class Block(nn.Module):
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
     def forward(self, x, ve, cos_sin, window_size):
-        # Stochastic depth: skip this block with probability drop_prob during training
+        # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
-            if torch.rand(1).item() < self.drop_prob:
-                return x
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+            keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
+            x_in = x
+            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.mlp(norm(x))
+            x = x_in + keep * (x - x_in)
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.mlp(norm(x))
         return x
 
 
