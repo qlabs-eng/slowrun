@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 
 import torch
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -72,18 +74,10 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
-# Curriculum learning: order training sequences by GPT-2 perplexity
-parser.add_argument("--curriculum-scores", type=str, default=None,
-                    help="Path to per-sequence perplexity scores tensor")
-parser.add_argument("--curriculum-mode", type=str, default="random",
-                    choices=["random", "easy2hard", "hard2easy", "adaptive"],
-                    help="Data ordering strategy")
-parser.add_argument("--curriculum-easy-epochs", type=int, default=3,
-                    help="Epochs of easy-first ordering (adaptive mode)")
-parser.add_argument("--curriculum-hard-epochs", type=int, default=3,
-                    help="Epochs of hard-first ordering at end (adaptive mode)")
-parser.add_argument("--rope-global-theta", type=float, default=1000000.0,
-                    help="RoPE theta for global (L) attention layers (default: 1000000)")
+parser.add_argument("--swa-last-epochs", type=int, default=3,
+                    help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--stoch-depth", type=float, default=0.05,
+                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -189,7 +183,7 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
-    rope_global_theta: float = 10000.0
+    stoch_depth: float = 0.05
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -259,8 +253,14 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
+        self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
     def forward(self, x, ve, cos_sin, window_size):
+        # Stochastic depth: skip this block with probability drop_prob during training
+        if self.training and self.drop_prob > 0:
+            if torch.rand(1).item() < self.drop_prob:
+                return x
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
         x = x + self.mlp(norm(x))
         return x
@@ -288,23 +288,9 @@ class GPT(nn.Module):
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
-        cos_local, sin_local = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.register_buffer("cos_local", cos_local, persistent=False)
-        self.register_buffer("sin_local", sin_local, persistent=False)
-        if config.rope_global_theta != 10000.0:
-            cos_global, sin_global = self._precompute_rotary(self.rotary_seq_len, head_dim, base=config.rope_global_theta)
-            self.register_buffer("cos_global", cos_global, persistent=False)
-            self.register_buffer("sin_global", sin_global, persistent=False)
-        else:
-            self.register_buffer("cos_global", cos_local, persistent=False)
-            self.register_buffer("sin_global", sin_local, persistent=False)
-        # Backward compat: cos/sin point to local (used by init_weights recompute)
-        self.register_buffer("cos", cos_local, persistent=False)
-        self.register_buffer("sin", sin_local, persistent=False)
-        # Per-layer type map: True if global (L), False if local (S)
-        pattern = config.window_pattern.upper()
-        self._layer_is_global = [(pattern[i % len(pattern)] == 'L') or (i == config.n_layer - 1)
-                                 for i in range(config.n_layer)]
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
 
     def set_dupe_layers(self, start, end, loops=2):
@@ -323,10 +309,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            normal_std = self.config.n_embd ** -0.5
+            torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
@@ -337,18 +324,9 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
-        cos_local, sin_local = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.cos_local = cos_local
-        self.sin_local = sin_local
-        self.cos = cos_local
-        self.sin = sin_local
-        if self.config.rope_global_theta != 10000.0:
-            cos_global, sin_global = self._precompute_rotary(self.rotary_seq_len, head_dim, base=self.config.rope_global_theta)
-            self.cos_global = cos_global
-            self.sin_global = sin_global
-        else:
-            self.cos_global = cos_local
-            self.sin_global = sin_local
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+        self.cos = cos
+        self.sin = sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -417,14 +395,9 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _get_cos_sin_for_layer(self, i, T):
-        """Return (cos, sin) sliced to T for the given layer index."""
-        if self._layer_is_global[i]:
-            return self.cos_global[:, :T], self.sin_global[:, :T]
-        return self.cos_local[:, :T], self.sin_local[:, :T]
-
     def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
         """Run decoder layers [start, end), with U-Net skip connections."""
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -432,22 +405,21 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            cos_sin_i = self._get_cos_sin_for_layer(i, T)
-            x = self.transformer.h[i](x, ve, cos_sin_i, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            cos_sin_i = self._get_cos_sin_for_layer(i, T)
-            x = self.transformer.h[i](x, ve, cos_sin_i, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
             encoder_outputs.append(x)
 
         # Decoder half
@@ -479,19 +451,14 @@ class GPT(nn.Module):
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
 # =============================================================================
 
-# Gram Newton-Schulz with CuTeDSL symmetric kernels (Dao-AILab/gram-newton-schulz)
-from gram_newton_schulz import GramNewtonSchulz, POLAR_EXPRESS_COEFFICIENTS
-_gns_orthogonalizer = None
-
-def _get_gns():
-    global _gns_orthogonalizer
-    if _gns_orthogonalizer is None:
-        _gns_orthogonalizer = GramNewtonSchulz(
-            ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
-            gram_newton_schulz_reset_iterations=[2],
-            ns_use_kernels=True,
-        )
-    return _gns_orthogonalizer
+# Polar Express coefficients for orthogonalization
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
@@ -503,15 +470,24 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
 @torch.compile(dynamic=False, fullgraph=True)
-def muon_momentum_fused(stacked_grads, momentum_buffer, momentum_t):
-    """Apply momentum to stacked gradients. Returns momentum-applied grads."""
+def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    return stacked_grads.lerp_(momentum_buffer, momentum)
-
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_update_fused(g, stacked_params, second_momentum_buffer, lr_t, wd_t, beta2_t, red_dim):
-    """Variance reduction + cautious weight decay + parameter update."""
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # Polar Express orthogonalization
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            X = a * X + X @ (b * A + c * (A @ A))
+    else:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            X = a * X + (b * A + c * (A @ A)) @ X
+    g = X
+    # Variance reduction
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
@@ -523,6 +499,7 @@ def muon_update_fused(g, stacked_params, second_momentum_buffer, lr_t, wd_t, bet
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
+    # Cautious weight decay + update
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
@@ -622,15 +599,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            # Phase 1: momentum
-            g = muon_momentum_fused(info['grad_chunk'][:num_owned],
-                                    state["momentum_buffer"][:num_owned],
-                                    self._muon_momentum_t)
-            # Phase 2: Gram Newton-Schulz orthogonalization (CuTeDSL symmetric kernels)
-            g = _get_gns()(g)
-            # Phase 3: variance reduction + cautious WD + update
-            muon_update_fused(g, owned, state["second_momentum_buffer"][:num_owned],
-                              self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t, red_dim)
+            muon_step_fused(info['grad_chunk'][:num_owned], owned,
+                          state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                          self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                          group["ns_steps"], red_dim)
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
@@ -658,22 +630,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever.
+    """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
 
-    Supports curriculum learning: when scores are provided, sequences can be
-    ordered by GPT-2 perplexity instead of randomly shuffled.
-
-    Modes:
-      - random: standard random shuffle each epoch (default)
-      - easy2hard: ascending perplexity order every epoch (block-shuffled)
-      - hard2easy: descending perplexity order every epoch (block-shuffled)
-      - adaptive: easy-first for first N epochs, random in middle, hard-first
-                  for last M epochs
-    """
-
-    def __init__(self, filepath, B, T, device="cuda",
-                 scores_path=None, curriculum_mode="random",
-                 easy_epochs=3, hard_epochs=3, num_epochs=12):
+    def __init__(self, filepath, B, T, device="cuda"):
         data = torch.load(filepath, weights_only=True)
         chunks = data['chunks']
         valid_counts = data['valid_counts']
@@ -687,108 +646,30 @@ class DataLoader:
             rows = chunk.view(file_B, sequence_size)[:vc]
             all_seqs.append(rows)
         all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
-        N = len(all_seqs)
 
         # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
         seqs_per_step = B * world_size
-        num_steps = N // seqs_per_step
+        num_steps = len(all_seqs) // seqs_per_step
         usable = num_steps * seqs_per_step
-
-        # Load perplexity scores for curriculum ordering
-        self.curriculum_mode = curriculum_mode
-        self.easy_epochs = easy_epochs
-        self.hard_epochs = hard_epochs
-        self.num_epochs = num_epochs
-        self.scores = None
-        self.sorted_asc = None   # indices sorted by ascending perplexity
-        self.sorted_desc = None  # indices sorted by descending perplexity
-
-        if scores_path is not None and curriculum_mode != "random":
-            raw_scores = torch.load(scores_path, weights_only=True)
-            assert len(raw_scores) >= N, (
-                f"Scores ({len(raw_scores)}) must cover all sequences ({N})")
-            self.scores = raw_scores[:usable]
-            self.sorted_asc = torch.argsort(self.scores)       # easy→hard
-            self.sorted_desc = torch.argsort(self.scores, descending=True)
-            print0(f"Curriculum: {curriculum_mode} mode, "
-                   f"{usable} usable seqs scored (of {N}), "
-                   f"ppl range [{self.scores.min():.2f}, {self.scores.max():.2f}]")
-
-        # Initial shaping (will be re-ordered in _shuffle)
         all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
-        self.all_data = all_seqs  # keep shaped reference for curriculum reordering
-        self.B = B
-        self.world_size = world_size
-        self.rank = rank
-        self.sequence_size = sequence_size
+
         self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
         self.num_steps = num_steps
         self.total_tokens = usable * T  # trainable tokens across all ranks
         self.device = device
         self.pos = 0
         self.epoch = 1
-        # Keep a flat (usable, T+1) reference for score-based reordering
-        self._flat_seqs = all_seqs.view(usable, sequence_size)
 
     def __iter__(self):
         return self
 
-    def _get_epoch_mode(self, epoch):
-        """Determine ordering mode for a given epoch."""
-        if self.curriculum_mode == "random" or self.scores is None:
-            return "random"
-        elif self.curriculum_mode == "easy2hard":
-            return "easy2hard"
-        elif self.curriculum_mode == "hard2easy":
-            return "hard2easy"
-        elif self.curriculum_mode == "adaptive":
-            if epoch <= self.easy_epochs:
-                return "easy2hard"
-            elif epoch > self.num_epochs - self.hard_epochs:
-                return "hard2easy"
-            else:
-                return "random"
-        return "random"
-
     def _shuffle(self):
-        """Shuffle or sort batch order for the new epoch, consistent across ranks."""
-        mode = self._get_epoch_mode(self.epoch)
-        seqs_per_step = self.B * self.world_size
-
-        if mode == "random":
-            # Standard random shuffle at batch level
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            perm = torch.randperm(self.num_steps, generator=g)
-            self.rank_data = self.all_data[perm][:, self.rank].contiguous()
-        else:
-            # Score-based ordering with block-level shuffle for variety
-            if mode == "easy2hard":
-                seq_order = self.sorted_asc
-            else:  # hard2easy
-                seq_order = self.sorted_desc
-
-            # Reorder sequences, then reshape into (num_steps, world_size, B, T+1)
-            ordered = self._flat_seqs[seq_order].view(
-                self.num_steps, self.world_size, self.B, self.sequence_size)
-
-            # Block shuffle: divide into 8 blocks, shuffle within each block
-            # Preserves global ordering direction while adding local variety
-            n_blocks = 8
-            block_size = self.num_steps // n_blocks
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            for b in range(n_blocks):
-                start = b * block_size
-                end = start + block_size if b < n_blocks - 1 else self.num_steps
-                local_perm = torch.randperm(end - start, generator=g)
-                ordered[start:end] = ordered[start + local_perm]
-
-            self.rank_data = ordered[:, self.rank].contiguous()
-
-        if self.epoch <= 3 or self.epoch >= self.num_epochs - 1:
-            print0(f"  Epoch {self.epoch}: data order = {mode}")
+        """Shuffle batch order for the new epoch, consistent across ranks."""
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        perm = torch.randperm(self.num_steps, generator=g)
+        self.rank_data = self.rank_data[perm]
 
     def __next__(self):
         if self.pos >= self.num_steps:
@@ -950,7 +831,8 @@ if master_process:
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
-print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}, rope_global_theta={args.rope_global_theta}")
+print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
+print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
@@ -974,7 +856,8 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, rope_global_theta=args.rope_global_theta)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
+                   stoch_depth=args.stoch_depth)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -999,12 +882,7 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device,
-                          scores_path=args.curriculum_scores,
-                          curriculum_mode=args.curriculum_mode,
-                          easy_epochs=args.curriculum_easy_epochs,
-                          hard_epochs=args.curriculum_hard_epochs,
-                          num_epochs=args.num_epochs)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -1030,6 +908,9 @@ def get_lr_multiplier(it):
 
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
+
+steps_per_epoch = num_iterations / args.num_epochs
+_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
 
 # Training loop
 step = 0
@@ -1086,6 +967,11 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
+    # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
+    if _swa_start_step >= 0 and step >= _swa_start_step:
+        cycle_pos = (step - _swa_start_step) % steps_per_epoch
+        swa_base = max(lrm, 0.05)
+        lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
