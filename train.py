@@ -36,7 +36,7 @@ _script_start = time.time()
 
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=12) 
+parser.add_argument("--num-epochs", type=int, default=11)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
@@ -62,7 +62,7 @@ parser.add_argument("--dupe-layers-end", type=int, default=21,
 parser.add_argument("--dupe-loops", type=int, default=2,
                     help="Number of extra replay passes through dupe layers")
 parser.add_argument("--warmdown-ratio", type=float, default=None,
-                    help="Override warmdown ratio (default 0.4)")
+                    help="Override warmdown ratio (default 0.2)")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
 parser.add_argument("--logit-avg", type=int, default=3,
@@ -78,6 +78,8 @@ parser.add_argument("--swa-last-epochs", type=int, default=3,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
+parser.add_argument("--mtp-weight", type=float, default=0.3,
+                    help="Multi-token prediction weight (0=off)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -296,6 +298,10 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
+        self.mtp_weight = args.mtp_weight
+        if self.mtp_weight > 0:
+            self.mtp_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+            self.mtp_block = Block(config, config.n_layer)
 
     def set_dupe_layers(self, start, end, loops=2):
         assert start >= self.encoder_layers, "dupe layers must be decoder-only"
@@ -309,23 +315,26 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
-        for block in self.transformer.h:
+        normal_std = self.config.n_embd ** -0.5
+        all_blocks = list(self.transformer.h)
+        if self.mtp_weight > 0:
+            all_blocks.append(self.mtp_block)
+            torch.nn.init.uniform_(self.mtp_proj.weight, -s, s)
+        for block in all_blocks:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            normal_std = self.config.n_embd ** -0.5
             torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+            torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-            torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
@@ -374,6 +383,8 @@ class GPT(nn.Module):
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
         matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        if self.mtp_weight > 0:
+            matrix_params += list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -446,10 +457,25 @@ class GPT(nn.Module):
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
-        if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                ignore_index=-1, reduction=loss_reduction)
-        return logits
+        if targets is None:
+            return logits
+        lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                  ignore_index=-1, reduction=loss_reduction)
+        if loss_reduction != 'mean':
+            return lm_loss
+        if self.mtp_weight <= 0:
+            return lm_loss, {'lm_loss': lm_loss}
+        mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
+        combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
+        mT = combined.size(1)
+        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
+        mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
+        if LOGIT_CAP > 0:
+            mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
+        mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
+                                   targets[:, 1:].reshape(-1), ignore_index=-1)
+        loss = lm_loss + self.mtp_weight * mtp_loss
+        return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -964,7 +990,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss, metrics = model(x, y)
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -1001,7 +1027,8 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
     dupe_str = " [DUPE]" if dupe_active else ""
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
+                   **{f"train/{k}": v.item() for k, v in metrics.items()}})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
