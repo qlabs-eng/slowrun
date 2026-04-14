@@ -80,12 +80,12 @@ parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--mtp-weight", type=float, default=0.3,
                     help="Multi-token prediction weight (0=off)")
-parser.add_argument("--iha", action="store_true",
-                    help="Enable Interleaved Head Attention (cross-head Q/K mixing)")
-parser.add_argument("--iha-v", action="store_true",
-                    help="Also mix V across heads (requires --iha)")
-parser.add_argument("--iha-lr", type=float, default=None,
-                    help="Override LR for IHA mixing matrices (default: SCALAR_LR)")
+parser.add_argument("--iha", action="store_true", default=True,
+                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
+parser.add_argument("--no-iha", action="store_false", dest="iha",
+                    help="Disable IHA cross-head mixing")
+parser.add_argument("--iha-lr", type=float, default=0.02,
+                    help="LR for IHA mixing matrices")
 args = parser.parse_args()
 
 # Resolve output path
@@ -193,7 +193,7 @@ class GPTConfig:
     dropout: float = 0.0
     stoch_depth: float = 0.05
     use_iha: bool = False
-    iha_mix_v: bool = False
+    iha_mix_v: bool = True
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -934,7 +934,7 @@ print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_l
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 if args.iha:
-    print0(f"  iha=True, iha_v={args.iha_v}, iha_lr={args.iha_lr}")
+    print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -954,7 +954,7 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
-                   use_iha=args.iha, iha_mix_v=args.iha_v)
+                   use_iha=args.iha, iha_mix_v=args.iha)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
