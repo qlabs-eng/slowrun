@@ -80,6 +80,12 @@ parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--mtp-weight", type=float, default=0.3,
                     help="Multi-token prediction weight (0=off)")
+parser.add_argument("--iha", action="store_true",
+                    help="Enable Interleaved Head Attention (cross-head Q/K mixing)")
+parser.add_argument("--iha-v", action="store_true",
+                    help="Also mix V across heads (requires --iha)")
+parser.add_argument("--iha-lr", type=float, default=None,
+                    help="Override LR for IHA mixing matrices (default: SCALAR_LR)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -186,6 +192,8 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
     stoch_depth: float = 0.05
+    use_iha: bool = False
+    iha_mix_v: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -218,12 +226,39 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
+        # IHA: cross-head mixing matrices (Interleaved Head Attention)
+        # Mixing is fused into projection weights at forward time.
+        # Cost: [H,H]@[H,d*C] matmul is negligible vs the [B*T,C]@[C,H*d] projection.
+        self.use_iha = config.use_iha
+        if self.use_iha:
+            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+            self.iha_mix_v = config.iha_mix_v
+            if self.iha_mix_v:
+                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+
+    def _fuse_mix(self, weight, mix, H):
+        """Fuse mixing matrix into projection weight: W_fused[h] = sum_m mix[h,m]*W[m]."""
+        d = self.head_dim
+        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if self.use_iha:
+            # Fuse mixing into weights then project — grad flows through mix params
+            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            if self.iha_mix_v:
+                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
+                v = v.view(B, T, self.n_kv_head, self.head_dim)
+            else:
+                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
@@ -331,6 +366,12 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            # IHA: initialize mixing matrices to identity (baseline-equivalent)
+            if block.attn.use_iha:
+                torch.nn.init.eye_(block.attn.q_mix)
+                torch.nn.init.eye_(block.attn.k_mix)
+                if block.attn.iha_mix_v:
+                    torch.nn.init.eye_(block.attn.v_mix)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
@@ -382,9 +423,28 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        # Separate IHA mixing params (small H×H matrices) from large matrix params
+        iha_params = []
+        iha_param_ids = set()
+        all_blocks = list(self.transformer.h)
         if self.mtp_weight > 0:
-            matrix_params += list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters())
+            all_blocks_for_iha = all_blocks + [self.mtp_block]
+        else:
+            all_blocks_for_iha = all_blocks
+        for block in all_blocks_for_iha:
+            if block.attn.use_iha:
+                iha_params.append(block.attn.q_mix)
+                iha_params.append(block.attn.k_mix)
+                iha_param_ids.add(id(block.attn.q_mix))
+                iha_param_ids.add(id(block.attn.k_mix))
+                if block.attn.iha_mix_v:
+                    iha_params.append(block.attn.v_mix)
+                    iha_param_ids.add(id(block.attn.v_mix))
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
+        if self.mtp_weight > 0:
+            mtp_params = [p for p in list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters()) if id(p) not in iha_param_ids]
+            matrix_params += mtp_params
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -400,6 +460,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
+        # IHA mixing matrices: use AdamW with dedicated or scalar-like LR
+        if iha_params:
+            iha_lr = args.iha_lr if args.iha_lr is not None else SCALAR_LR
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -869,6 +933,8 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+if args.iha:
+    print0(f"  iha=True, iha_v={args.iha_v}, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -887,7 +953,8 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
-                   stoch_depth=args.stoch_depth)
+                   stoch_depth=args.stoch_depth,
+                   use_iha=args.iha, iha_mix_v=args.iha_v)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
