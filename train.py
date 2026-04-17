@@ -569,6 +569,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # MuonEq-R row normalization
+    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
