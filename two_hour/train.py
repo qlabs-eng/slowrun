@@ -86,7 +86,10 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
+parser.add_argument("--window-schedule", type=str, default="",
+                    help="Epoch-window schedule 'start-end:short,long;...'. Applies YaRN on long-window expansions.")
 args = parser.parse_args()
+args.window_schedule_spec = args.window_schedule.strip()
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -126,6 +129,69 @@ WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio if args.warmdown_ratio is not None else 0.2
 FINAL_LR_FRAC = 0.0
 LOGIT_CAP = args.logit_cap
+
+
+@dataclass(frozen=True)
+class WindowScheduleStage:
+    start_epoch: int
+    end_epoch: int
+    short_window: int
+    long_window: int
+
+
+def parse_window_schedule(spec, max_seq_len):
+    if not spec:
+        return ()
+    stages = []
+    prev_end = 0
+    for raw_stage in spec.split(";"):
+        raw_stage = raw_stage.strip()
+        if not raw_stage:
+            continue
+        if ":" not in raw_stage:
+            raise ValueError(f"Invalid --window-schedule stage '{raw_stage}': expected 'start-end:short,long'")
+        epoch_part, window_part = raw_stage.split(":", 1)
+        epoch_part = epoch_part.strip()
+        window_part = window_part.strip()
+        if "-" in epoch_part:
+            start_raw, end_raw = epoch_part.split("-", 1)
+        else:
+            start_raw = epoch_part
+            end_raw = epoch_part
+        if "," not in window_part:
+            raise ValueError(f"Invalid --window-schedule stage '{raw_stage}': expected 'short,long'")
+        short_raw, long_raw = window_part.split(",", 1)
+        start_epoch = int(start_raw)
+        end_epoch = int(end_raw)
+        short_window = int(short_raw)
+        long_window = int(long_raw)
+        if start_epoch <= 0 or end_epoch < start_epoch:
+            raise ValueError(f"Invalid epoch range '{epoch_part}' in --window-schedule")
+        if short_window <= 0 or long_window <= 0:
+            raise ValueError(f"Window sizes must be positive in --window-schedule, got {short_window},{long_window}")
+        if short_window > long_window:
+            raise ValueError(f"Short window must be <= long window in --window-schedule, got {short_window},{long_window}")
+        if long_window > max_seq_len:
+            raise ValueError(f"Long window must be <= sequence length ({max_seq_len}), got {long_window}")
+        if start_epoch != prev_end + 1:
+            raise ValueError("--window-schedule stages must be contiguous and start at epoch 1")
+        stages.append(WindowScheduleStage(start_epoch, end_epoch, short_window, long_window))
+        prev_end = end_epoch
+    return tuple(stages)
+
+
+def get_window_schedule_stage(schedule, epoch):
+    if not schedule:
+        return None
+    for stage in schedule:
+        if stage.start_epoch <= epoch <= stage.end_epoch:
+            return stage
+    if epoch > schedule[-1].end_epoch:
+        return schedule[-1]
+    raise ValueError(f"No --window-schedule stage covers epoch {epoch}")
+
+
+args.window_schedule = parse_window_schedule(args.window_schedule_spec, MAX_SEQ_LEN)
 
 # =============================================================================
 # Utilities
@@ -171,9 +237,9 @@ def _load_fa3():
 
 _fa3 = _load_fa3()
 
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), softmax_scale=None):
     """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
-    return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    return _fa3.flash_attn_func(q, k, v, causal=causal, softmax_scale=softmax_scale, window_size=window_size)
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
@@ -194,6 +260,7 @@ class GPTConfig:
     stoch_depth: float = 0.05
     use_iha: bool = False
     iha_mix_v: bool = True
+    use_window_schedule: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -206,6 +273,49 @@ def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], 3)
+
+
+class Yarn(nn.Module):
+    def __init__(self, head_dim, max_seq_len, base=10000):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        inv_freq = self._build_inv_freq(device=torch.device("meta"))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        cos = inv_freq.new_empty(1, max_seq_len, 1, head_dim // 2)
+        sin = inv_freq.new_empty(1, max_seq_len, 1, head_dim // 2)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        self.attn_scale = head_dim ** -0.5
+        self.reset()
+
+    def _build_inv_freq(self, device):
+        return 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device) / self.head_dim))
+
+    @torch.no_grad()
+    def reset(self):
+        self.inv_freq.copy_(self._build_inv_freq(device=self.inv_freq.device))
+        self._refresh_tables()
+        self.attn_scale = self.head_dim ** -0.5
+
+    @torch.no_grad()
+    def _refresh_tables(self):
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.inv_freq.device)
+        freqs = torch.outer(t, self.inv_freq)
+        self.cos.copy_(freqs.cos()[None, :, None, :].bfloat16())
+        self.sin.copy_(freqs.sin()[None, :, None, :].bfloat16())
+
+    @torch.no_grad()
+    def apply(self, old_window: int, new_window: int, alpha: int = 1, beta: int = 32):
+        if new_window <= old_window:
+            raise ValueError(f"YaRN window updates must expand context, got {old_window} -> {new_window}")
+        rotations = old_window * self.inv_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.inv_freq.mul_(scaling_factor + interpolation_weight * (1 - scaling_factor))
+        self._refresh_tables()
+        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
 
 class CausalSelfAttention(nn.Module):
@@ -239,7 +349,7 @@ class CausalSelfAttention(nn.Module):
         d = self.head_dim
         return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
         B, T, C = x.size()
         if self.use_iha:
             q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
@@ -263,7 +373,16 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        fa_dtype = q.dtype
+        if fa_dtype not in (torch.float16, torch.bfloat16):
+            fa_dtype = torch.bfloat16
+        if q.dtype != fa_dtype:
+            q = q.to(dtype=fa_dtype)
+        if k.dtype != fa_dtype:
+            k = k.to(dtype=fa_dtype)
+        if v.dtype != fa_dtype:
+            v = v.to(dtype=fa_dtype)
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, softmax_scale=softmax_scale)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -289,16 +408,16 @@ class Block(nn.Module):
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
             x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
             x = x + self.mlp(norm(x))
             x = x_in + keep * (x - x_in)
         else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
             x = x + self.mlp(norm(x))
         return x
 
@@ -307,7 +426,10 @@ class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
         self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
+        self.window_pattern = config.window_pattern.upper()
+        self.short_window = config.sequence_len // 2
+        self.long_window = config.sequence_len
+        self.window_sizes = self._compute_window_sizes(self.short_window, self.long_window)
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
@@ -325,9 +447,12 @@ class GPT(nn.Module):
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        if config.use_window_schedule:
+            self.yarn = Yarn(head_dim, self.rotary_seq_len)
+        else:
+            cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+            self.register_buffer("cos", cos, persistent=False)
+            self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
         self.mtp_weight = args.mtp_weight
         if self.mtp_weight > 0:
@@ -373,9 +498,12 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(proj.weight, -s, s)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.cos = cos
-        self.sin = sin
+        if self.config.use_window_schedule:
+            self.yarn.reset()
+        else:
+            cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+            self.cos = cos
+            self.sin = sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -387,16 +515,40 @@ class GPT(nn.Module):
         cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
         return cos[None, :, None, :], sin[None, :, None, :]
 
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        long_w, short_w = config.sequence_len, config.sequence_len // 2
+    def _compute_window_sizes(self, short_w, long_w):
         char_to_w = {"L": (long_w, 0), "S": (short_w, 0)}
-        sizes = [char_to_w[pattern[i % len(pattern)]] for i in range(config.n_layer)]
+        sizes = [char_to_w[self.window_pattern[i % len(self.window_pattern)]] for i in range(self.config.n_layer)]
         sizes[-1] = (long_w, 0)  # final layer always full context
         return sizes
 
+    @torch.no_grad()
+    def set_window_sizes(self, short_window, long_window, apply_yarn=False):
+        short_window = int(short_window)
+        long_window = int(long_window)
+        if short_window <= 0 or long_window <= 0 or short_window > long_window:
+            raise ValueError(f"Invalid active windows short={short_window}, long={long_window}")
+        if long_window > self.config.sequence_len:
+            raise ValueError(f"Long window must be <= sequence length ({self.config.sequence_len}), got {long_window}")
+        if apply_yarn and hasattr(self, "yarn") and long_window != self.long_window:
+            if long_window < self.long_window:
+                raise ValueError(f"Window schedule cannot shrink long context after start, got {self.long_window} -> {long_window}")
+            self.yarn.apply(self.long_window, long_window)
+        self.short_window = short_window
+        self.long_window = long_window
+        self.window_sizes = self._compute_window_sizes(short_window, long_window)
+
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def _get_cos_sin(self, seq_len):
+        if hasattr(self, "yarn"):
+            return self.yarn.cos[:, :seq_len], self.yarn.sin[:, :seq_len]
+        return self.cos[:, :seq_len], self.sin[:, :seq_len]
+
+    def _get_attention_softmax_scale(self):
+        if hasattr(self, "yarn"):
+            return self.yarn.attn_scale
+        return None
 
     def _avg_causal_attended_keys(self, window, seq_len):
         if window < 0 or window >= seq_len - 1:
@@ -466,7 +618,8 @@ class GPT(nn.Module):
 
     def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        cos_sin = self._get_cos_sin(T)
+        softmax_scale = self._get_attention_softmax_scale()
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -474,21 +627,22 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        cos_sin = self._get_cos_sin(T)
+        softmax_scale = self._get_attention_softmax_scale()
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
             encoder_outputs.append(x)
 
         # Decoder half
@@ -522,7 +676,7 @@ class GPT(nn.Module):
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
+        mtp_out = norm(self.mtp_block(combined, None, self._get_cos_sin(mT), (-1, -1), softmax_scale=softmax_scale))
         mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
@@ -559,6 +713,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # MuonEq-R row normalization
+    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -924,6 +1080,8 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+if args.window_schedule:
+    print0(f"  window_schedule={args.window_schedule_spec}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -942,11 +1100,20 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
-                   stoch_depth=args.stoch_depth, use_iha=args.iha)
+                   stoch_depth=args.stoch_depth,
+                   use_iha=args.iha,
+                   iha_mix_v=args.iha,
+                   use_window_schedule=bool(args.window_schedule))
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+
+active_window_stage = None
+if args.window_schedule:
+    active_window_stage = get_window_schedule_stage(args.window_schedule, 1)
+    model.set_window_sizes(active_window_stage.short_window, active_window_stage.long_window)
+    print0(f"Initial window stage: epoch {active_window_stage.start_epoch}-{active_window_stage.end_epoch} -> short={active_window_stage.short_window}, long={active_window_stage.long_window}")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
@@ -1124,6 +1291,20 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             print0(f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})")
 
         model.train()
+        if args.window_schedule:
+            new_stage = get_window_schedule_stage(args.window_schedule, epoch)
+            if new_stage != active_window_stage:
+                orig_model.set_window_sizes(new_stage.short_window, new_stage.long_window, apply_yarn=True)
+                active_window_stage = new_stage
+                num_flops_per_token = orig_model.estimate_flops()
+                timing_start_step = step + 4
+                print0(f"Updated window stage for epoch {epoch}: short={new_stage.short_window}, long={new_stage.long_window}, yarn_scale={orig_model._get_attention_softmax_scale():.6f}")
+                wandb_run.log({
+                    "step": step,
+                    "schedule/window_short": new_stage.short_window,
+                    "schedule/window_long": new_stage.long_window,
+                    "schedule/yarn_scale": orig_model._get_attention_softmax_scale(),
+                })
         # Update num_iterations estimate now that we know real steps per epoch
         # steps_per_epoch = step // current_epoch
         # num_iterations = steps_per_epoch * args.num_epochs
@@ -1194,6 +1375,9 @@ if args.save_result and master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "window_schedule": args.window_schedule_spec,
+        "window_short": orig_model.short_window,
+        "window_long": orig_model.long_window,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
