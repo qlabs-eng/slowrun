@@ -19,8 +19,6 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 
 import torch
-import torch._dynamo
-torch._dynamo.config.cache_size_limit = 64
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -36,7 +34,7 @@ _script_start = time.time()
 
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=4)
-parser.add_argument("--num-epochs", type=int, default=11)
+parser.add_argument("--num-epochs", type=int, default=12) 
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
@@ -62,7 +60,7 @@ parser.add_argument("--dupe-layers-end", type=int, default=21,
 parser.add_argument("--dupe-loops", type=int, default=2,
                     help="Number of extra replay passes through dupe layers")
 parser.add_argument("--warmdown-ratio", type=float, default=None,
-                    help="Override warmdown ratio (default 0.2)")
+                    help="Override warmdown ratio (default 0.4)")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
 parser.add_argument("--logit-avg", type=int, default=3,
@@ -74,18 +72,29 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
+parser.add_argument("--pretrained-ckpt", type=str, default=None,
+                    help="Path to NCA pre-pre-trained checkpoint (pre_pre_train.py output). "
+                         "Loads all weights except embed and lm_head (different vocab sizes).")
+parser.add_argument("--nca-warmup-steps", type=int, default=0,
+                    help="Steps to freeze transformer body (Muon + scalar groups) and train only "
+                         "embed+lm_head after NCA pre-pretraining. Paper uses ~10-20%% of total steps.")
+parser.add_argument("--nca-rampup-steps", type=int, default=200,
+                    help="After NCA warmup, linearly ramp transformer body LR from 0 to full over this "
+                         "many steps. Prevents pretrained features from being destroyed by abrupt full LR.")
+parser.add_argument("--nca-load-mode", type=str, default="all",
+                    choices=["all", "attn", "attn+norm"],
+                    help="Which PPT weights to load: 'all' = full transformer body (default), "
+                         "'attn' = only attention layers (c_q/c_k/c_v/c_proj/attn_gate), "
+                         "'attn+norm' = attention + skip/residual/x0 scalars. "
+                         "Paper shows MLP transfer hurts for text; 'attn' is recommended.")
+parser.add_argument("--max-train-time", type=float, default=None,
+                    help="Max cumulative training step time in minutes (None = unlimited). "
+                         "Counts only forward+backward pass time, excludes eval and checkpoint saving.")
+parser.add_argument("--max-wall-time", type=float, default=None,
+                    help="Max total wall-clock time in minutes (None = unlimited). "
+                         "Measured from script start, includes eval and checkpoint saving.")
 parser.add_argument("--swa-last-epochs", type=int, default=3,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
-parser.add_argument("--stoch-depth", type=float, default=0.05,
-                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
-parser.add_argument("--mtp-weight", type=float, default=0.3,
-                    help="Multi-token prediction weight (0=off)")
-parser.add_argument("--iha", action="store_true", default=True,
-                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
-parser.add_argument("--no-iha", action="store_false", dest="iha",
-                    help="Disable IHA cross-head mixing")
-parser.add_argument("--iha-lr", type=float, default=0.02,
-                    help="LR for IHA mixing matrices")
 args = parser.parse_args()
 
 # Resolve output path
@@ -191,9 +200,6 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
-    stoch_depth: float = 0.05
-    use_iha: bool = False
-    iha_mix_v: bool = True
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -226,39 +232,12 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # IHA: cross-head mixing matrices (Interleaved Head Attention)
-        # Mixing is fused into projection weights at forward time.
-        # Cost: [H,H]@[H,d*C] matmul is negligible vs the [B*T,C]@[C,H*d] projection.
-        self.use_iha = config.use_iha
-        if self.use_iha:
-            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
-            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
-            self.iha_mix_v = config.iha_mix_v
-            if self.iha_mix_v:
-                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
-
-    def _fuse_mix(self, weight, mix, H):
-        """Fuse mixing matrix into projection weight: W_fused[h] = sum_m mix[h,m]*W[m]."""
-        d = self.head_dim
-        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        if self.use_iha:
-            # Fuse mixing into weights then project — grad flows through mix params
-            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
-            q = q.view(B, T, self.n_head, self.head_dim)
-            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
-            k = k.view(B, T, self.n_kv_head, self.head_dim)
-            if self.iha_mix_v:
-                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
-                v = v.view(B, T, self.n_kv_head, self.head_dim)
-            else:
-                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-        else:
-            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
@@ -290,20 +269,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-        # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
-        self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
     def forward(self, x, ve, cos_sin, window_size):
-        # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
-        if self.training and self.drop_prob > 0:
-            keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
-            x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
-            x = x_in + keep * (x - x_in)
-        else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
+        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+        x = x + self.mlp(norm(x))
         return x
 
 
@@ -329,14 +298,10 @@ class GPT(nn.Module):
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
-        self.mtp_weight = args.mtp_weight
-        if self.mtp_weight > 0:
-            self.mtp_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
-            self.mtp_block = Block(config, config.n_layer)
 
     def set_dupe_layers(self, start, end, loops=2):
         assert start >= self.encoder_layers, "dupe layers must be decoder-only"
@@ -350,37 +315,27 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
-        normal_std = self.config.n_embd ** -0.5
-        all_blocks = list(self.transformer.h)
-        if self.mtp_weight > 0:
-            all_blocks.append(self.mtp_block)
-            torch.nn.init.uniform_(self.mtp_proj.weight, -s, s)
-        for block in all_blocks:
+        for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            normal_std = self.config.n_embd ** -0.5
             torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-            torch.nn.init.zeros_(block.attn.attn_gate.weight)
-            # IHA: initialize mixing matrices to identity (baseline-equivalent)
-            if block.attn.use_iha:
-                torch.nn.init.eye_(block.attn.q_mix)
-                torch.nn.init.eye_(block.attn.k_mix)
-                if block.attn.iha_mix_v:
-                    torch.nn.init.eye_(block.attn.v_mix)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
+        for block in self.transformer.h:
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+            torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
-        self.cos = cos
-        self.sin = sin
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -423,28 +378,7 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate IHA mixing params (small H×H matrices) from large matrix params
-        iha_params = []
-        iha_param_ids = set()
-        all_blocks = list(self.transformer.h)
-        if self.mtp_weight > 0:
-            all_blocks_for_iha = all_blocks + [self.mtp_block]
-        else:
-            all_blocks_for_iha = all_blocks
-        for block in all_blocks_for_iha:
-            if block.attn.use_iha:
-                iha_params.append(block.attn.q_mix)
-                iha_params.append(block.attn.k_mix)
-                iha_param_ids.add(id(block.attn.q_mix))
-                iha_param_ids.add(id(block.attn.k_mix))
-                if block.attn.iha_mix_v:
-                    iha_params.append(block.attn.v_mix)
-                    iha_param_ids.add(id(block.attn.v_mix))
-        all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
-        if self.mtp_weight > 0:
-            mtp_params = [p for p in list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters()) if id(p) not in iha_param_ids]
-            matrix_params += mtp_params
+        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -453,17 +387,13 @@ class GPT(nn.Module):
         skip_params = [self.skip_weights]
 
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=lm_head_params, nca_embed=True, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=embed_params, nca_embed=True, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
-        # IHA mixing matrices: use AdamW with dedicated or scalar-like LR
-        if iha_params:
-            iha_lr = args.iha_lr if args.iha_lr is not None else SCALAR_LR
-            param_groups.append(dict(kind='adamw', params=iha_params, lr=iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -474,9 +404,8 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -489,9 +418,9 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
@@ -504,42 +433,27 @@ class GPT(nn.Module):
         # Decoder half
         dupe = self._dupe_layers
         if dupe is None:
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, self.config.n_layer, T)
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, self.config.n_layer)
         else:
             # First pass: encoder boundary through end of dupe range
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, dupe[1], T)
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, dupe[1])
             # Extra replays through dupe range
             for _ in range(self._dupe_loops):
-                x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                            dupe[0], dupe[1], T)
+                x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                            dupe[0], dupe[1])
             # Remaining decoder layers
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        dupe[1], self.config.n_layer, T)
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[1], self.config.n_layer)
 
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
-        if targets is None:
-            return logits
-        lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                  ignore_index=-1, reduction=loss_reduction)
-        if loss_reduction != 'mean':
-            return lm_loss
-        if self.mtp_weight <= 0:
-            return lm_loss, {'lm_loss': lm_loss}
-        mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
-        combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
-        mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
-        mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
-        if LOGIT_CAP > 0:
-            mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
-        mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
-                                   targets[:, 1:].reshape(-1), ignore_index=-1)
-        loss = lm_loss + self.mtp_weight * mtp_loss
-        return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
+        if targets is not None:
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                ignore_index=-1, reduction=loss_reduction)
+        return logits
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -569,8 +483,6 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # MuonEq-R row normalization
-    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -785,9 +697,9 @@ class DataLoader:
 def evaluate_bpb(model, batches, steps, token_bytes):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
-    total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    total_bytes = torch.tensor(0.0, dtype=torch.float64, device=model.get_device())
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
-    total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    total_tokens = torch.tensor(0.0, dtype=torch.float64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
@@ -806,6 +718,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
     total_nats, total_bytes = total_nats.item(), total_bytes.item()
     total_loss, total_tokens = total_loss.item(), total_tokens.item()
+    print0(f"  [DEBUG] total_loss={total_loss:.6e}, total_tokens={total_tokens}, total_nats={total_nats:.6e}, total_bytes={total_bytes}")
     bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
     return bpb, loss
@@ -851,9 +764,9 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
 
     # Compute metrics from accumulated target probs using running totals
     total_nats   = torch.tensor(0.0, dtype=torch.float64, device=dev)
-    total_bytes  = torch.tensor(0, dtype=torch.int64, device=dev)
+    total_bytes  = torch.tensor(0.0, dtype=torch.float64, device=dev)
     total_loss   = torch.tensor(0.0, dtype=torch.float64, device=dev)
-    total_tokens = torch.tensor(0, dtype=torch.int64, device=dev)
+    total_tokens = torch.tensor(0.0, dtype=torch.float64, device=dev)
 
     for i, y in enumerate(all_y):
         y_flat = y.view(-1).to(dev)
@@ -917,7 +830,7 @@ else:
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
-_wandb_kwargs = {"project": "slowrun", "name": run_name}
+_wandb_kwargs = {"project": "nanochat", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
@@ -928,15 +841,12 @@ if master_process:
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
-print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
-if args.iha:
-    print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -954,13 +864,41 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
-                   stoch_depth=args.stoch_depth,
-                   use_iha=args.iha, iha_mix_v=args.iha)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+
+# Load NCA pre-pre-trained weights (skipping embed + lm_head — different vocab sizes)
+if args.pretrained_ckpt:
+    print0(f"Loading NCA pre-pre-trained checkpoint: {args.pretrained_ckpt} (mode={args.nca_load_mode})")
+    ckpt = torch.load(args.pretrained_ckpt, map_location="cpu", weights_only=True)
+    ckpt.pop('config', None)  # remove metadata dict if present
+    # Always skip embed + lm_head (vocab size mismatch)
+    skip_prefixes = ['transformer.wte.', 'lm_head.']
+    if args.nca_load_mode == 'attn':
+        # Only load attention weights — paper shows MLP transfer hurts for text
+        attn_keys = ('.attn.c_q.', '.attn.c_k.', '.attn.c_v.', '.attn.c_proj.',
+                     '.attn.attn_gate.', '.attn.ve_gate.')
+        filtered = {k: v for k, v in ckpt.items()
+                    if any(ak in k for ak in attn_keys)}
+    elif args.nca_load_mode == 'attn+norm':
+        # Attention + scalar params (residual lambdas, x0 lambdas, skip weights)
+        attn_keys = ('.attn.c_q.', '.attn.c_k.', '.attn.c_v.', '.attn.c_proj.',
+                     '.attn.attn_gate.', '.attn.ve_gate.')
+        scalar_keys = ('resid_lambdas', 'x0_lambdas', 'skip_weights')
+        filtered = {k: v for k, v in ckpt.items()
+                    if any(ak in k for ak in attn_keys) or any(k.startswith(sk) for sk in scalar_keys)}
+    else:  # 'all' — original behavior
+        filtered = {k: v for k, v in ckpt.items()
+                    if not any(k.startswith(p) for p in skip_prefixes)}
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    print0(f"  Loaded {len(filtered)} param tensors (mode={args.nca_load_mode})")
+    print0(f"  Freshly initialized: {len(missing)} params")
+    if unexpected:
+        print0(f"  WARNING — unexpected keys: {unexpected}")
+    del ckpt, filtered
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
@@ -1018,6 +956,7 @@ min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
+total_step_time = 0.0
 timed_steps = 0
 timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
@@ -1059,20 +998,36 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss, metrics = model(x, y)
+            loss = model(x, y)
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
+    nca_warmup = args.nca_warmup_steps if args.pretrained_ckpt else 0
+    nca_rampup = args.nca_rampup_steps if nca_warmup > 0 else 0
+    in_nca_warmup = nca_warmup > 0 and step <= nca_warmup
+    in_nca_rampup = nca_rampup > 0 and step > nca_warmup and step <= nca_warmup + nca_rampup
+    if in_nca_warmup and step == 1:
+        print0(f"NCA embedding warmup: freezing transformer body for {nca_warmup} steps")
+    if nca_warmup > 0 and step == nca_warmup + 1:
+        print0(f"NCA embedding warmup complete at step {step - 1}; ramping up transformer body LR over {nca_rampup} steps")
+    if nca_rampup > 0 and step == nca_warmup + nca_rampup + 1:
+        print0(f"NCA rampup complete at step {step - 1}; full LR active")
     # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
     if _swa_start_step >= 0 and step >= _swa_start_step:
         cycle_pos = (step - _swa_start_step) % steps_per_epoch
         swa_base = max(lrm, 0.05)
         lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+        if in_nca_warmup and not group.get('nca_embed', False):
+            group["lr"] = 0.0
+        elif in_nca_rampup and not group.get('nca_embed', False):
+            rampup_frac = (step - nca_warmup) / nca_rampup
+            group["lr"] = group["initial_lr"] * lrm * rampup_frac
+        else:
+            group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
@@ -1082,6 +1037,15 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     dt = time.time() - t0
 
     step += 1
+    total_step_time += dt
+
+    # Time-based stopping
+    if args.max_train_time is not None and total_step_time > args.max_train_time * 60:
+        print0(f"Reached max train time ({args.max_train_time}m) at step {step}, stopping.")
+        break
+    if args.max_wall_time is not None and (time.time() - _script_start) > args.max_wall_time * 60:
+        print0(f"Reached max wall time ({args.max_wall_time}m) at step {step}, stopping.")
+        break
 
     # Logging
     ema_beta = 0.9
@@ -1095,9 +1059,10 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         timed_steps += 1
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
     dupe_str = " [DUPE]" if dupe_active else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
-                   **{f"train/{k}": v.item() for k, v in metrics.items()}})
+    train_t_str = f" | train_t: {total_step_time/60:.2f}m"
+    wall_t_str = f" | wall_t: {(time.time() - _script_start)/60:.2f}m"
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{train_t_str}{wall_t_str}{eta_str}")
+    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1166,8 +1131,8 @@ if logit_avg_count > 0:
         n = len(ckpt_paths_for_logit)
         print0(f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---")
 
-        la_model = torch.compile(orig_model, dynamic=False)
-        la_model.eval()
+        orig_model.eval()
+        la_model = orig_model
 
         def _run_mode(label, weights):
             print0(f"  [{label}] weights: {[f'{w:.3f}' for w in weights]}")
