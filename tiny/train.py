@@ -14,6 +14,10 @@ import math
 import time
 import json
 import argparse
+import sys
+import secrets
+import shutil
+import string
 from types import SimpleNamespace
 from functools import partial
 from dataclasses import dataclass
@@ -39,7 +43,8 @@ parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=32)
 parser.add_argument("--num-epochs", type=int, default=16)
 parser.add_argument("--patience", type=int, default=-1)
-parser.add_argument("--run", type=str, default=None)
+parser.add_argument("--run-name", type=str, default=None,
+                    help="Run name under runs/ (default: random 6-char string)")
 parser.add_argument("--scalar-lr", type=float, default=0.25)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
@@ -69,6 +74,8 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--no-doc-shuffle", action="store_true",
+                    help="Disable per-epoch document reshuffling (still shuffles batch order)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -89,6 +96,8 @@ WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
 DATA_DIR = "fineweb_data"
+BOS_ID = 50256  # <|endoftext|>
+RUNS_DIR = "runs"
 
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
@@ -126,6 +135,29 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
+
+class TeeStream:
+    """Save terminal output to file."""
+    def __init__(self, *streams):
+        self.streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8")
+    def write(self, data):
+        for stream in self.streams: stream.write(data)
+        return len(data)
+    def flush(self):
+        for stream in self.streams: stream.flush()
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+    def fileno(self):
+        return self.streams[0].fileno()
+
+def resolve_run_dir(run_name):
+    if run_name:
+        actual_run_name = run_name
+    else:
+        alphabet = string.ascii_lowercase + string.digits
+        actual_run_name = "".join(secrets.choice(alphabet) for _ in range(6))
+    return actual_run_name, os.path.join(RUNS_DIR, actual_run_name)
 
 # =============================================================================
 # Flash Attention (FA3 on Hopper, SDPA fallback elsewhere)
@@ -189,6 +221,7 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1
+    device_batch_size: int = 32
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -606,53 +639,76 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
+    """Loads flat tokens + chunks into batches.
 
-    def __init__(self, filepath, B, T, device="cuda"):
+    doc_shuffle=False: applies the stored default sequence permutation (bitwise match
+    with the old chunked pipeline), shuffles batch order each epoch.
+    doc_shuffle=True: reshuffles documents each epoch, re-chunks, re-shuffles sequences.
+    """
+
+    def __init__(self, filepath, B, T, device="cuda", *, doc_shuffle=False):
         data = torch.load(filepath, weights_only=True)
-        chunks = data['chunks']
-        valid_counts = data['valid_counts']
-        file_B = data['batch_size']
-        sequence_size = data['sequence_size']
-        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
+        all_tokens = data["tokens"].long()
+        raw_doc_starts = data["doc_starts"].long()
+        bos_id = int(data["bos_id"])
+        assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
 
-        # Gather all valid sequences into one tensor
-        all_seqs = []
-        for chunk, vc in zip(chunks, valid_counts):
-            rows = chunk.view(file_B, sequence_size)[:vc]
-            all_seqs.append(rows)
-        all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
+        doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
+        self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
+        self.default_shuffle_seed = data["seq_shuffle_seed"]
 
-        # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
-        seqs_per_step = B * world_size
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.B = B
+        self.T = T
+        self.seq_size = T + 1
+        self.doc_shuffle = doc_shuffle
+        self.epoch = 1
+        self._build_batches()
+
+    def _build_batches(self):
+        tokens = torch.cat(self.doc_tokens)
+        num_seqs = len(tokens) // self.seq_size
+        all_seqs = tokens[:num_seqs * self.seq_size].view(num_seqs, self.seq_size)
+        if self.doc_shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.epoch + 1000)
+            all_seqs = all_seqs[torch.randperm(num_seqs, generator=g)]
+        else:   # Use dataset-stored permutation seed for backwards compatibility.
+            perm = np.random.RandomState(self.default_shuffle_seed).permutation(num_seqs)
+            all_seqs = all_seqs[torch.from_numpy(perm)]
+        seqs_per_step = self.B * self.world_size
         num_steps = len(all_seqs) // seqs_per_step
         usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
-
-        self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
+        all_seqs = all_seqs[:usable].view(num_steps, self.world_size, self.B, self.seq_size)
+        self.rank_data = all_seqs[:, self.rank].contiguous()
         self.num_steps = num_steps
-        self.total_tokens = usable * T  # trainable tokens across all ranks
-        self.device = device
+        self.total_tokens = usable * self.T
         self.pos = 0
-        self.epoch = 1
 
     def __iter__(self):
         return self
 
-    def _shuffle(self):
-        """Shuffle batch order for the new epoch, consistent across ranks."""
-        g = torch.Generator()
-        g.manual_seed(self.epoch)
-        perm = torch.randperm(self.num_steps, generator=g)
-        self.rank_data = self.rank_data[perm]
+    def _next_epoch(self):
+        self.epoch += 1
+        print0(f"Starting epoch {self.epoch}")
+        if self.doc_shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            perm = torch.randperm(len(self.doc_tokens), generator=g)
+            self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
+            self._build_batches()
+        else:
+            self.pos = 0
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            self.rank_data = self.rank_data[torch.randperm(self.num_steps, generator=g)]
 
     def __next__(self):
         if self.pos >= self.num_steps:
-            self.pos = 0
-            self.epoch += 1
-            print0(f"Starting epoch {self.epoch}")
-            self._shuffle()
+            self._next_epoch()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
@@ -727,11 +783,36 @@ if _fa3 is not None:
 else:
     print0("Using PyTorch SDPA fallback (no FA3)")
 
+# Run / logging paths
+run_name, run_dir = resolve_run_dir(args.run_name)
+if dist.is_initialized():
+    shared = [run_name]
+    dist.broadcast_object_list(shared, src=0)
+    run_name = shared[0]
+    run_dir = os.path.join(RUNS_DIR, run_name)
+checkpoints_dir = os.path.join(run_dir, "checkpoints")
+artifact_model_path = os.path.join(run_dir, "model.pt")
+terminal_log_path = os.path.join(run_dir, "terminal.log")
+stdout_orig = sys.stdout
+stderr_orig = sys.stderr
+artifacts_log_f = None
+result_path = os.path.join(run_dir, "result.json")
+os.makedirs(run_dir, exist_ok=True)
+if master_process:
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
+    shutil.copy2(__file__, os.path.join(run_dir, "train.py"))
+if dist.is_initialized():
+    dist.barrier()
+artifacts_log_f = open(terminal_log_path, "a", encoding="utf-8", buffering=1)
+sys.stdout = TeeStream(sys.stdout, artifacts_log_f)
+sys.stderr = TeeStream(sys.stderr, artifacts_log_f)
+
 # wandb
-run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
 _wandb_kwargs = {"project": "slowrun", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
+_wandb_kwargs["dir"] = os.path.join(run_dir, "wandb")
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
 if master_process:
     wandb_run.log_code(".")
@@ -746,6 +827,9 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  doc_shuffle={not args.no_doc_shuffle}")
+print0(f"  run={run_name}")
+print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -763,7 +847,7 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -788,7 +872,7 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -919,9 +1003,8 @@ while current_epoch <= args.num_epochs:
         print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
         wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
         # Save checkpoint for weight averaging
-        ckpt_path = os.path.join("tiny_ckpts", f"epoch_{current_epoch:03d}.pt")
+        ckpt_path = os.path.join(checkpoints_dir, f"epoch_{current_epoch:03d}.pt")
         if master_process:
-            os.makedirs("tiny_ckpts", exist_ok=True)
             torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, ckpt_path)
         late_ckpt_paths.append(ckpt_path)
         if len(late_ckpt_paths) > args.swa_last_epochs:
@@ -1001,7 +1084,7 @@ print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
-if args.save_result and master_process:
+if master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
@@ -1010,13 +1093,25 @@ if args.save_result and master_process:
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
-    with open(args.save_result, "w") as f:
+    with open(result_path, "w") as f:
         json.dump(result, f, indent=2)
-    print0(f"Result saved to {args.save_result}")
+    print0(f"Result saved to {result_path}")
 
+# Save final model
+if master_process:
+    print0(f"Saving model to {artifact_model_path}")
+    torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, artifact_model_path)
+
+print0(f"Min val BPB: {min_val_bpb:.6f} | Min val Loss: {min_val_loss:.6f}")
 total_wall_time = time.time() - _script_start
 print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
+if artifacts_log_f is not None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stdout = stdout_orig
+    sys.stderr = stderr_orig
+    artifacts_log_f.close()
