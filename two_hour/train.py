@@ -80,6 +80,14 @@ parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--mtp-weight", type=float, default=0.3,
                     help="Multi-token prediction weight (0=off)")
+parser.add_argument("--iha", action="store_true", default=True,
+                    help="Enable Interleaved Head Attention (arxiv 2602.21371)")
+parser.add_argument("--no-iha", action="store_false", dest="iha",
+                    help="Disable IHA")
+parser.add_argument("--iha-lr", type=float, default=0.02,
+                    help="LR for IHA mixing matrices")
+parser.add_argument("--iha-P", type=int, default=2,
+                    help="Number of pseudo-heads per head for IHA interleaving")
 args = parser.parse_args()
 
 # Resolve output path
@@ -186,6 +194,9 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
     stoch_depth: float = 0.05
+    use_iha: bool = False
+    iha_mix_v: bool = True
+    iha_P: int = 2
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -218,21 +229,58 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
+        # IHA: Interleaved Head Attention (arxiv 2602.21371)
+        # P pseudo-heads per head via mixing, interleaved into sequence for P² patterns.
+        self.use_iha = config.use_iha
+        self.iha_P = config.iha_P if config.use_iha else 1
+        if self.use_iha:
+            P = self.iha_P
+            # Mixing matrices: alpha[src_head, tgt_head, pseudo_idx]
+            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head, P))
+            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head, P))
+            self.iha_mix_v = config.iha_mix_v
+            if self.iha_mix_v:
+                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head, P))
+            # Collapse matrix: [H, P] weights to reduce pseudo-heads back to 1
+            self.iha_collapse = nn.Parameter(torch.zeros(self.n_head, P))
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-        # Value residual (ResFormer)
+        # Value residual (ResFormer) — applied before interleaving
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.use_iha:
+            P = self.iha_P
+            # Step 1: Generate P pseudo-heads via mixing
+            q = torch.einsum('btmd,mhp->bthpd', q, self.q_mix)
+            k = torch.einsum('btmd,mhp->bthpd', k, self.k_mix)
+            if self.iha_mix_v:
+                v = torch.einsum('btmd,mhp->bthpd', v, self.v_mix)
+            else:
+                v = v.unsqueeze(3).expand(-1, -1, -1, P, -1)
+            # Step 2: Interleave pseudo-heads into sequence: [B,T,H,P,d] → [B,T*P,H,d]
+            q = q.permute(0, 1, 3, 2, 4).reshape(B, T * P, self.n_head, self.head_dim)
+            k = k.permute(0, 1, 3, 2, 4).reshape(B, T * P, self.n_kv_head, self.head_dim)
+            v = v.permute(0, 1, 3, 2, 4).reshape(B, T * P, self.n_kv_head, self.head_dim)
+            # Step 3: RoPE on expanded T*P sequence
+            cos, sin = cos_sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)
+            # Step 4: Attention on expanded sequence with FLOP-matched windows
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Step 5: De-interleave + collapse pseudo-heads
+            y = y.view(B, T, P, self.n_head, self.head_dim).permute(0, 1, 3, 2, 4)
+            y = torch.einsum('bthpd,hp->bthd', y, self.iha_collapse)
+        else:
+            cos, sin = cos_sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -331,6 +379,19 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            # IHA: initialize mixing to identity-like (pseudo-head 0 = original)
+            if block.attn.use_iha:
+                P = block.attn.iha_P
+                torch.nn.init.zeros_(block.attn.q_mix)
+                torch.nn.init.zeros_(block.attn.k_mix)
+                for h in range(block.attn.n_head):
+                    block.attn.q_mix.data[h, h, 0] = 1.0
+                    block.attn.k_mix.data[h, h, 0] = 1.0
+                if block.attn.iha_mix_v:
+                    torch.nn.init.zeros_(block.attn.v_mix)
+                    for h in range(block.attn.n_kv_head):
+                        block.attn.v_mix.data[h, h, 0] = 1.0
+                block.attn.iha_collapse.data.fill_(1.0 / P)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
@@ -353,7 +414,16 @@ class GPT(nn.Module):
 
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
-        long_w, short_w = config.sequence_len, config.sequence_len // 2
+        N = config.sequence_len
+        if config.use_iha:
+            P = config.iha_P
+            # Paper-faithful FLOP-matched IHA window schedule:
+            # W_paper = N/(2P²) in original-token units → expanded FA window = W_paper * P
+            # Global (L) layers use full expanded context (N*P)
+            short_w = (N * P) // (2 * P * P)  # = N/(2P) = 512 for P=2, N=2048
+            long_w = N * P                     # full expanded context = 4096 for P=2
+        else:
+            long_w, short_w = N, N // 2
         char_to_w = {"L": (long_w, 0), "S": (short_w, 0)}
         sizes = [char_to_w[pattern[i % len(pattern)]] for i in range(config.n_layer)]
         sizes[-1] = (long_w, 0)  # final layer always full context
@@ -382,9 +452,25 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        # Separate IHA mixing params from large matrix params
+        iha_params = []
+        iha_param_ids = set()
+        all_blocks_for_iha = list(self.transformer.h)
         if self.mtp_weight > 0:
-            matrix_params += list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters())
+            all_blocks_for_iha = all_blocks_for_iha + [self.mtp_block]
+        for block in all_blocks_for_iha:
+            if block.attn.use_iha:
+                for p in [block.attn.q_mix, block.attn.k_mix, block.attn.iha_collapse]:
+                    iha_params.append(p)
+                    iha_param_ids.add(id(p))
+                if block.attn.iha_mix_v:
+                    iha_params.append(block.attn.v_mix)
+                    iha_param_ids.add(id(block.attn.v_mix))
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
+        if self.mtp_weight > 0:
+            mtp_params = [p for p in list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters()) if id(p) not in iha_param_ids]
+            matrix_params += mtp_params
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -400,6 +486,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
+        if iha_params:
+            iha_lr = args.iha_lr if args.iha_lr is not None else SCALAR_LR
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -412,7 +501,8 @@ class GPT(nn.Module):
 
     def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
         """Run decoder layers [start, end), with U-Net skip connections."""
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        iha_P = self.config.iha_P if self.config.use_iha else 1
+        cos_sin = (self.cos[:, :T * iha_P], self.sin[:, :T * iha_P])
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -427,7 +517,8 @@ class GPT(nn.Module):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        iha_P = self.config.iha_P if self.config.use_iha else 1
+        cos_sin = (self.cos[:, :T * iha_P], self.sin[:, :T * iha_P])
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
@@ -468,7 +559,7 @@ class GPT(nn.Module):
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
+        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT * iha_P], self.sin[:, :mT * iha_P]), (-1, -1)))
         mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
@@ -887,7 +978,8 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
-                   stoch_depth=args.stoch_depth)
+                   stoch_depth=args.stoch_depth,
+                   use_iha=args.iha, iha_mix_v=args.iha, iha_P=args.iha_P)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)

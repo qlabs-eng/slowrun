@@ -86,17 +86,6 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
-parser.add_argument("--iha-P", type=int, default=2,
-                    help="Number of pseudo-heads per head for IHA interleaving")
-parser.add_argument("--compile-mode", type=str, default="default",
-                    choices=["default", "lite", "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune", "none"],
-                    help="torch.compile mode for the model (default=plain inductor compile)")
-parser.add_argument("--compile-fullgraph", action="store_true",
-                    help="Compile the full model graph with fullgraph=True")
-parser.add_argument("--eval-tokens", type=int, default=10_000_000,
-                    help="Validation token budget per eval pass (0 disables evals)")
-parser.add_argument("--max-steps", type=int, default=0,
-                    help="Optional optimizer-step cap for compile/throughput probes")
 args = parser.parse_args()
 
 # Resolve output path
@@ -115,7 +104,7 @@ HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
-EVAL_TOKENS = args.eval_tokens
+EVAL_TOKENS = 10_000_000
 DATA_DIR = "fineweb_data"
 
 # Base optimizer hyperparameters
@@ -163,20 +152,6 @@ def load_state_dict_into_model(model, state_dict):
         if name in state_dict:
             p.data.copy_(state_dict[name].to(p.device, dtype=p.dtype))
 
-def compile_model(model):
-    if args.compile_mode == "none":
-        return model
-    compile_kwargs = {"backend": "inductor", "dynamic": False}
-    if args.compile_mode != "default":
-        compile_kwargs["mode"] = args.compile_mode
-    if args.compile_fullgraph:
-        compile_kwargs["fullgraph"] = True
-    return torch.compile(model, **compile_kwargs)
-
-def maybe_mark_cudagraph_step_begin():
-    if args.compile_mode in {"reduce-overhead", "max-autotune"}:
-        torch.compiler.cudagraph_mark_step_begin()
-
 # =============================================================================
 # Flash Attention (FA3 on Hopper)
 # =============================================================================
@@ -219,7 +194,6 @@ class GPTConfig:
     stoch_depth: float = 0.05
     use_iha: bool = False
     iha_mix_v: bool = True
-    iha_P: int = 2
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -252,62 +226,48 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # IHA: Interleaved Head Attention (arxiv 2602.21371)
-        # P pseudo-heads per head via mixing, interleaved into sequence for P² patterns.
+        # IHA: cross-head mixing matrices (Interleaved Head Attention)
+        # Mixing is fused into projection weights at forward time.
+        # Cost: [H,H]@[H,d*C] matmul is negligible vs the [B*T,C]@[C,H*d] projection.
         self.use_iha = config.use_iha
-        self.iha_P = config.iha_P if config.use_iha else 1
         if self.use_iha:
-            P = self.iha_P
-            # Mixing matrices: alpha[src_head, tgt_head, pseudo_idx]
-            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head, P))
-            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head, P))
+            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
             self.iha_mix_v = config.iha_mix_v
             if self.iha_mix_v:
-                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head, P))
-            # Collapse matrix: [H, P] weights to reduce pseudo-heads back to 1
-            self.iha_collapse = nn.Parameter(torch.zeros(self.n_head, P))
+                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+
+    def _fuse_mix(self, weight, mix, H):
+        """Fuse mixing matrix into projection weight: W_fused[h] = sum_m mix[h,m]*W[m]."""
+        d = self.head_dim
+        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-        # Value residual (ResFormer) — applied before interleaving
+        if self.use_iha:
+            # Fuse mixing into weights then project — grad flows through mix params
+            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            if self.iha_mix_v:
+                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
+                v = v.view(B, T, self.n_kv_head, self.head_dim)
+            else:
+                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
-        if self.use_iha:
-            P = self.iha_P
-            # Step 1: Generate P pseudo-heads via mixing
-            # q: [B,T,H,d], q_mix: [H_src, H_tgt, P] → q_pseudo: [B,T,H,P,d]
-            q = torch.einsum('btmd,mhp->bthpd', q, self.q_mix)
-            k = torch.einsum('btmd,mhp->bthpd', k, self.k_mix)
-            if self.iha_mix_v:
-                v = torch.einsum('btmd,mhp->bthpd', v, self.v_mix)
-            else:
-                v = v.unsqueeze(3).expand(-1, -1, -1, P, -1)
-            # Step 2: Interleave pseudo-heads into sequence dimension
-            # [B,T,H,P,d] → permute to [B,T,P,H,d] → reshape [B,T*P,H,d]
-            q = q.permute(0, 1, 3, 2, 4).reshape(B, T * P, self.n_head, self.head_dim)
-            k = k.permute(0, 1, 3, 2, 4).reshape(B, T * P, self.n_kv_head, self.head_dim)
-            v = v.permute(0, 1, 3, 2, 4).reshape(B, T * P, self.n_kv_head, self.head_dim)
-            # Step 3: RoPE on expanded sequence positions [0, 1, ..., T*P-1]
-            cos, sin = cos_sin
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-            q, k = norm(q), norm(k)
-            # Step 4: Attention on expanded T*P sequence with FLOP-matched windows
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-            # Step 5: De-interleave and collapse pseudo-heads
-            # [B,T*P,H,d] → [B,T,P,H,d] → permute [B,T,H,P,d]
-            y = y.view(B, T, P, self.n_head, self.head_dim).permute(0, 1, 3, 2, 4)
-            # Collapse: weighted sum over P pseudo-heads → [B,T,H,d]
-            y = torch.einsum('bthpd,hp->bthd', y, self.iha_collapse)
-        else:
-            cos, sin = cos_sin
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-            q, k = norm(q), norm(k)
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -368,14 +328,11 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
-        self._ve_proj_by_layer = tuple(self.ve_projs[str(i)] if has_ve(i, config.n_layer) else None for i in range(config.n_layer))
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
-        self._dupe_loops = 0
-        self._decoder_layer_plan = tuple(range(self.encoder_layers, config.n_layer))
         self.mtp_weight = args.mtp_weight
         if self.mtp_weight > 0:
             self.mtp_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
@@ -386,12 +343,6 @@ class GPT(nn.Module):
         assert end <= self.config.n_layer
         self._dupe_layers = (start, end)
         self._dupe_loops = loops
-        replay_layers = tuple(range(start, end))
-        self._decoder_layer_plan = (
-            tuple(range(self.encoder_layers, end))
-            + replay_layers * loops
-            + tuple(range(end, self.config.n_layer))
-        )
         print0(f"Dupe layers {start}-{end-1}: {loops} extra replays ({loops+1} total passes)")
 
     @torch.no_grad()
@@ -415,21 +366,12 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
-            # IHA: initialize mixing to identity-like (pseudo-head 0 = original, rest small)
+            # IHA: initialize mixing matrices to identity (baseline-equivalent)
             if block.attn.use_iha:
-                P = block.attn.iha_P
-                # Pseudo-head 0: identity mapping (baseline-equivalent)
-                torch.nn.init.zeros_(block.attn.q_mix)
-                torch.nn.init.zeros_(block.attn.k_mix)
-                for h in range(block.attn.n_head):
-                    block.attn.q_mix.data[h, h, 0] = 1.0
-                    block.attn.k_mix.data[h, h, 0] = 1.0
+                torch.nn.init.eye_(block.attn.q_mix)
+                torch.nn.init.eye_(block.attn.k_mix)
                 if block.attn.iha_mix_v:
-                    torch.nn.init.zeros_(block.attn.v_mix)
-                    for h in range(block.attn.n_kv_head):
-                        block.attn.v_mix.data[h, h, 0] = 1.0
-                # Collapse: uniform over pseudo-heads initially
-                block.attn.iha_collapse.data.fill_(1.0 / P)
+                    torch.nn.init.eye_(block.attn.v_mix)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
@@ -452,16 +394,7 @@ class GPT(nn.Module):
 
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
-        N = config.sequence_len
-        if config.use_iha:
-            P = config.iha_P
-            # Paper-faithful FLOP-matched IHA window schedule:
-            # W_paper = N/(2P²) in original-token units → expanded FA window = W_paper * P
-            # Global (L) layers use full expanded context (N*P)
-            short_w = (N * P) // (2 * P * P)  # = N/(2P) = 512 for P=2, N=2048
-            long_w = N * P                     # full expanded context = 4096
-        else:
-            long_w, short_w = N, N // 2
+        long_w, short_w = config.sequence_len, config.sequence_len // 2
         char_to_w = {"L": (long_w, 0), "S": (short_w, 0)}
         sizes = [char_to_w[pattern[i % len(pattern)]] for i in range(config.n_layer)]
         sizes[-1] = (long_w, 0)  # final layer always full context
@@ -500,9 +433,10 @@ class GPT(nn.Module):
             all_blocks_for_iha = all_blocks
         for block in all_blocks_for_iha:
             if block.attn.use_iha:
-                for p in [block.attn.q_mix, block.attn.k_mix, block.attn.iha_collapse]:
-                    iha_params.append(p)
-                    iha_param_ids.add(id(p))
+                iha_params.append(block.attn.q_mix)
+                iha_params.append(block.attn.k_mix)
+                iha_param_ids.add(id(block.attn.q_mix))
+                iha_param_ids.add(id(block.attn.k_mix))
                 if block.attn.iha_mix_v:
                     iha_params.append(block.attn.v_mix)
                     iha_param_ids.add(id(block.attn.v_mix))
@@ -540,38 +474,49 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
+        """Run decoder layers [start, end), with U-Net skip connections."""
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        for i in range(start, end):
+            # Encoder layer j connects to decoder layer (n_layer - 1 - j)
+            j = self.config.n_layer - 1 - i
+            if 0 <= j < self.encoder_layers:
+                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+        return x
+
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
-        iha_P = self.config.iha_P if self.config.use_iha else 1
-        cos_sin = (self.cos[:, :T * iha_P], self.sin[:, :T * iha_P])
-        blocks = self.transformer.h
-        ve_proj_by_layer = self._ve_proj_by_layer
-        window_sizes = self.window_sizes
-        resid_lambdas = self.resid_lambdas
-        x0_lambdas = self.x0_lambdas
-        encoder_layers = self.encoder_layers
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
-        for i in range(encoder_layers):
-            x = resid_lambdas[i] * x + x0_lambdas[i] * x0
-            ve_proj = ve_proj_by_layer[i]
-            ve = ve_proj(x0) if ve_proj is not None else None
-            x = blocks[i](x, ve, cos_sin, window_sizes[i])
+        for i in range(self.encoder_layers):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
             encoder_outputs.append(x)
 
-        # Decoder half, including any duplicated decoder passes
-        for i in self._decoder_layer_plan:
-            # Encoder layer j connects to decoder layer (n_layer - 1 - j)
-            j = self.config.n_layer - 1 - i
-            if 0 <= j < encoder_layers:
-                x = x + self.skip_weights[i - encoder_layers] * encoder_outputs[j]
-            x = resid_lambdas[i] * x + x0_lambdas[i] * x0
-            ve_proj = ve_proj_by_layer[i]
-            ve = ve_proj(x0) if ve_proj is not None else None
-            x = blocks[i](x, ve, cos_sin, window_sizes[i])
+        # Decoder half
+        dupe = self._dupe_layers
+        if dupe is None:
+            x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                        self.encoder_layers, self.config.n_layer, T)
+        else:
+            # First pass: encoder boundary through end of dupe range
+            x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                        self.encoder_layers, dupe[1], T)
+            # Extra replays through dupe range
+            for _ in range(self._dupe_loops):
+                x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                            dupe[0], dupe[1], T)
+            # Remaining decoder layers
+            x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                        dupe[1], self.config.n_layer, T)
 
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
@@ -587,7 +532,7 @@ class GPT(nn.Module):
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT * iha_P], self.sin[:, :mT * iha_P]), (-1, -1)))
+        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
         mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
@@ -844,7 +789,6 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        maybe_mark_cudagraph_step_begin()
         loss2d = model(x, y, loss_reduction='none').view(-1)
         y = y.view(-1)
         mask = y != -1
@@ -898,7 +842,6 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
         for i, (x, y) in enumerate(zip(all_x, all_y)):
             y_flat = y.view(-1).to(dev)
             with autocast_ctx:
-                maybe_mark_cudagraph_step_begin()
                 logits = eval_model(x.to(dev))
             probs = torch.softmax(logits.view(BT, V).float(), dim=-1)
             tgt   = probs[torch.arange(BT, device=dev), y_flat.clamp_min(0)]
@@ -990,9 +933,8 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
-print0(f"  compile_mode={args.compile_mode}, compile_fullgraph={args.compile_fullgraph}")
 if args.iha:
-    print0(f"  iha=True, P={args.iha_P}, iha_lr={args.iha_lr}")
+    print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -1012,7 +954,7 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
-                   use_iha=args.iha, iha_mix_v=args.iha, iha_P=args.iha_P)
+                   use_iha=args.iha, iha_mix_v=args.iha)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1029,10 +971,10 @@ print0(f"FLOPs per token: {num_flops_per_token:e}")
 
 # Compile
 orig_model = model
-model = compile_model(model)
+model = torch.compile(model, dynamic=False)
 
 # Optimizer
-optimizer = orig_model.setup_optimizer()
+optimizer = model.setup_optimizer()
 
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
@@ -1050,8 +992,6 @@ num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  #
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
-if args.max_steps > 0:
-    print0(f"Step cap: {args.max_steps}")
 
 # Schedulers
 def get_lr_multiplier(it):
@@ -1087,12 +1027,10 @@ if logit_avg_count > 0 and master_process:
     os.makedirs(args.logit_avg_dir, exist_ok=True)
 if logit_avg_count > 0:
     print0(f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/")
-if eval_steps == 0:
-    print0("Validation disabled (--eval-tokens=0)")
 
 if args.eval_logit_avg:
     print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
-elif eval_steps > 0:
+else:
     # Initial val evaluation
     model.eval()
     val_loader = build_val_loader()
@@ -1108,13 +1046,13 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     if not dupe_active and current_epoch >= args.dupe_start_epoch:
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end, args.dupe_loops)
-        model = compile_model(orig_model)
+        model = torch.compile(orig_model, dynamic=False)
+        # model = orig_model # replace compile with this line for eager mode
         dupe_active = True
         timing_start_step = step + 4  # skip dupe recompile + 3 warmup steps
         gc.enable(); gc.collect()
 
     # Training step
-    maybe_mark_cudagraph_step_begin()
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
@@ -1159,10 +1097,6 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
                    **{f"train/{k}": v.item() for k, v in metrics.items()}})
 
-    if args.max_steps > 0 and step >= args.max_steps:
-        print0(f"Stopping after {step} step(s) due to --max-steps")
-        break
-
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
         epoch_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
@@ -1170,7 +1104,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         epoch = epoch_tensor.item()
 
     # Epoch boundary: evaluate when the dataloader advances to a new epoch
-    if eval_steps > 0 and epoch != current_epoch:
+    if epoch != current_epoch:
         model.eval()
         val_loader = build_val_loader()
         with autocast_ctx:
@@ -1226,13 +1160,11 @@ if logit_avg_count > 0:
     else:
         ckpt_paths_for_logit = late_checkpoint_paths
 
-    if eval_steps == 0:
-        print0("Skipping logit averaging eval because validation is disabled.")
-    elif len(ckpt_paths_for_logit) >= 2:
+    if len(ckpt_paths_for_logit) >= 2:
         n = len(ckpt_paths_for_logit)
         print0(f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---")
 
-        la_model = compile_model(orig_model)
+        la_model = torch.compile(orig_model, dynamic=False)
         la_model.eval()
 
         def _run_mode(label, weights):
