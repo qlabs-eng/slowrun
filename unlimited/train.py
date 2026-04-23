@@ -3,8 +3,8 @@ Train an ensemble of language models and evaluate running ensemble val loss.
 
 Trains N models (default 20) with different random seeds, shuffling data each epoch.
 After each model is trained, computes ensemble val loss by averaging logits across
-all models trained so far. 
-The reported ensemble metric excludes model 0, which is weaker (no distillation 
+all models trained so far.
+The reported ensemble metric excludes model 0, which is weaker (no distillation
 teacher, fewer epochs) and hurts ensemble quality.
 
 Usage:
@@ -79,6 +79,16 @@ parser.add_argument("--ema-decays", type=str, default="0.95",
                     help="Comma-separated EMA decay rates, e.g. '0.999,0.9995,0.9998'")
 parser.add_argument("--ema-start-frac", type=float, default=0.90,
                     help="Fraction of training after which to start EMA tracking")
+parser.add_argument("--mtp-weight", type=float, default=0.3,
+                    help="Multi-token prediction weight (0=off)")
+parser.add_argument("--iha", action="store_true", default=True,
+                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
+parser.add_argument("--no-iha", action="store_false", dest="iha",
+                    help="Disable IHA cross-head mixing")
+parser.add_argument("--iha-lr", type=float, default=0.02,
+                    help="LR for IHA mixing matrices")
+parser.add_argument("--max-models-in-memory", type=int, default=4,
+                    help="Max ensemble models loaded per rank at once during ensemble eval")
 args = parser.parse_args()
 
 if args.output_json and not args.save_result:
@@ -114,6 +124,7 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.2
 FINAL_LR_FRAC = 0.0
+LOGIT_CAP = 15.0
 
 # =============================================================================
 # Utilities
@@ -206,6 +217,8 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
+    use_iha: bool = False
+    iha_mix_v: bool = True
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -237,12 +250,39 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
+        # IHA: cross-head mixing matrices (Interleaved Head Attention).
+        # Mixing is fused into projection weights at forward time.
+        # Cost: [H,H]@[H,d*C] matmul is negligible vs the [B*T,C]@[C,H*d] projection.
+        self.use_iha = config.use_iha
+        if self.use_iha:
+            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+            self.iha_mix_v = config.iha_mix_v
+            if self.iha_mix_v:
+                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+
+    def _fuse_mix(self, weight, mix, H):
+        """Fuse mixing matrix into projection weight: W_fused[h] = sum_m mix[h,m]*W[m]."""
+        d = self.head_dim
+        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if self.use_iha:
+            # Fuse mixing into weights then project — grad flows through mix params
+            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            if self.iha_mix_v:
+                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
+                v = v.view(B, T, self.n_kv_head, self.head_dim)
+            else:
+                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
@@ -308,6 +348,10 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
+        self.mtp_weight = args.mtp_weight
+        if self.mtp_weight > 0:
+            self.mtp_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+            self.mtp_block = Block(config, config.n_layer)
 
     def set_dupe_layers(self, start, end):
         assert start >= self.encoder_layers, "dupe layers must be decoder-only"
@@ -320,22 +364,32 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
-        for block in self.transformer.h:
+        normal_std = self.config.n_embd ** -0.5
+        all_blocks = list(self.transformer.h)
+        if self.mtp_weight > 0:
+            all_blocks.append(self.mtp_block)
+            torch.nn.init.uniform_(self.mtp_proj.weight, -s, s)
+        for block in all_blocks:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+            torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            # IHA: initialize mixing matrices to identity (baseline-equivalent)
+            if block.attn.use_iha:
+                torch.nn.init.eye_(block.attn.q_mix)
+                torch.nn.init.eye_(block.attn.k_mix)
+                if block.attn.iha_mix_v:
+                    torch.nn.init.eye_(block.attn.v_mix)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-            torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -365,7 +419,27 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        # Separate IHA mixing params (small H×H matrices) from large matrix params
+        iha_params = []
+        iha_param_ids = set()
+        all_blocks_for_iha = list(self.transformer.h)
+        if self.mtp_weight > 0:
+            all_blocks_for_iha = all_blocks_for_iha + [self.mtp_block]
+        for block in all_blocks_for_iha:
+            if block.attn.use_iha:
+                iha_params.append(block.attn.q_mix)
+                iha_params.append(block.attn.k_mix)
+                iha_param_ids.add(id(block.attn.q_mix))
+                iha_param_ids.add(id(block.attn.k_mix))
+                if block.attn.iha_mix_v:
+                    iha_params.append(block.attn.v_mix)
+                    iha_param_ids.add(id(block.attn.v_mix))
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
+        if self.mtp_weight > 0:
+            mtp_params = [p for p in list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters())
+                          if id(p) not in iha_param_ids]
+            matrix_params += mtp_params
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -381,6 +455,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
+        # IHA mixing matrices: use AdamW with dedicated LR
+        if iha_params:
+            iha_lr = args.iha_lr if args.iha_lr is not None else SCALAR_LR
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -403,7 +481,8 @@ class GPT(nn.Module):
             x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
         return x
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def _forward_trunk(self, idx):
+        """Run embedding + encoder + decoder (with dupe replays). Returns normed hidden state pre-lm_head."""
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
@@ -442,17 +521,55 @@ class GPT(nn.Module):
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
                                         dupe[1], self.config.n_layer)
 
-        x = norm(x)
+        return norm(x)
+
+    def _primary_logits(self, x):
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)
-        if targets is not None:
-            if loss_reduction == 'none':
-                return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+        logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP)
         return logits
 
+    def _mtp_loss(self, x, targets):
+        """Auxiliary next-next-token loss. x: trunk hidden state; targets: (B,T) hard labels."""
+        mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
+        combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
+        mT = combined.size(1)
+        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
+        mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
+        mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
+        return F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
+                               targets[:, 1:].reshape(-1), ignore_index=-1)
+
+    def forward(self, idx, targets=None, loss_reduction='mean', distill=False):
+        """
+        If targets is None: returns primary logits.
+        If targets is given and distill=True: returns (primary_logits, mtp_loss_tensor).
+            (mtp_loss is a zero scalar when mtp is disabled.)
+        If targets is given and distill=False:
+            - loss_reduction='none'/'sum': returns lm_loss with that reduction (no MTP).
+            - loss_reduction='mean': returns (total_loss, {'lm_loss', 'mtp_loss'?}).
+        """
+        x = self._forward_trunk(idx)
+        logits = self._primary_logits(x)
+        if targets is None:
+            return logits
+        if distill:
+            if self.mtp_weight > 0:
+                mtp_loss = self._mtp_loss(x, targets)
+            else:
+                mtp_loss = torch.zeros((), device=logits.device, dtype=torch.float32)
+            return logits, mtp_loss
+        lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                  ignore_index=-1, reduction=loss_reduction)
+        if loss_reduction != 'mean':
+            return lm_loss
+        if self.mtp_weight <= 0:
+            return lm_loss, {'lm_loss': lm_loss}
+        mtp_loss = self._mtp_loss(x, targets)
+        loss = lm_loss + self.mtp_weight * mtp_loss
+        return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
+
     def forward_logits(self, idx):
-        """Forward pass returning only logits (no loss computation)."""
+        """Forward pass returning only primary logits (no loss computation)."""
         return self.forward(idx, targets=None)
 
 # =============================================================================
@@ -482,6 +599,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # MuonEq-R row normalization
+    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
@@ -692,6 +811,67 @@ class DataLoader:
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
 
+
+class DDPValLoader:
+    """
+    Val-only loader with explicit rank/world_size (no implicit distributed sharding).
+
+    Used for ensemble eval where models are sharded across ranks but data is NOT
+    (every rank sees the same val batches). Instantiate with rank=0, world_size=1
+    on every rank to replay identical data everywhere. Deterministic via `seed`.
+
+    Supports replay by setting `self.pos = 0` (no reshuffle needed as long as
+    the loop stays within num_steps).
+    """
+    def __init__(self, filepath, B, T, rank, world_size, device="cuda", seed=0):
+        data = torch.load(filepath, weights_only=True)
+        chunks = data['chunks']
+        valid_counts = data['valid_counts']
+        file_B = data['batch_size']
+        sequence_size = data['sequence_size']
+        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
+
+        all_seqs = []
+        for chunk, vc in zip(chunks, valid_counts):
+            rows = chunk.view(file_B, sequence_size)[:vc]
+            all_seqs.append(rows)
+        all_seqs = torch.cat(all_seqs, dim=0).long()
+
+        seqs_per_step = B * world_size
+        num_steps = len(all_seqs) // seqs_per_step
+        usable = num_steps * seqs_per_step
+
+        self.all_seqs = all_seqs[:usable]
+        self.B = B
+        self.world_size = world_size
+        self.rank = rank
+        self.num_steps = num_steps
+        self.device = device
+        self.seed = seed
+        self.pos = 0
+        self.epoch = 1
+        self._shuffle_and_shard()
+
+    def _shuffle_and_shard(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed * 1000003 + self.epoch)
+        perm = torch.randperm(len(self.all_seqs), generator=g)
+        shuffled = self.all_seqs[perm]
+        shaped = shuffled.view(self.num_steps, self.world_size, self.B, -1)
+        self.rank_data = shaped[:, self.rank].contiguous()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.pos >= self.num_steps:
+            self.pos = 0
+            self.epoch += 1
+            self._shuffle_and_shard()
+        batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
+        self.pos += 1
+        return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
+
 # =============================================================================
 # Evaluation helpers
 # =============================================================================
@@ -729,85 +909,134 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 @torch.no_grad()
 def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocast_ctx):
     """
-    Compute ensemble val loss by averaging probabilities across all checkpoints.
+    Ensemble val loss with model-sharding across ranks.
 
-    For N models, the ensemble prediction is: mean(softmax(logits_1), ..., softmax(logits_N))
-    Loss is computed as -log(avg_prob[target]).
+    For N models and world_size W:
+      - rank r owns checkpoint_paths[r::W] (every W-th model).
+      - Each rank loads its owned models in chunks of args.max_models_in_memory,
+        running B-sized val batches through each chunk to compute p(y_t) per
+        position. The val loader is replayed deterministically between chunks
+        so batches are bit-identical across passes.
+      - Each rank accumulates a partial sum of p(y_t) over its owned models
+        into `my_psum[step, B*T]`. A single all_reduce(SUM) at the end gives
+        the full ensemble sum; divide by N and take -log to get the loss.
+
+    Memory: at most `max_models_in_memory` GPT models live on any one rank at a
+    time, so ensemble size is no longer bounded by single-GPU memory.
     """
+    _, rank, _, world_size = get_dist_info()
+    val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
+    B_eval = 2
+    max_mem = args.max_models_in_memory
+
     num_models = len(checkpoint_paths)
-    print0(f"  Loading {num_models} model(s) into GPU memory...")
+    my_indices = list(range(rank, num_models, world_size))
+    my_paths = [checkpoint_paths[i] for i in my_indices]
+    my_count = len(my_paths)
+    n_chunks = math.ceil(my_count / max_mem) if my_count > 0 else 0
 
-    # Load all models onto GPU
-    ensemble_models = []
-    for ckpt_path in checkpoint_paths:
-        with torch.device("meta"):
-            model = GPT(config)
-        model.to_empty(device=device)
-        model.init_weights(convert_embed=False)  # initializes rotary buffers only; skip bfloat16 embed cast
-        state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
-        model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
-        model.eval()
-        ensemble_models.append(model)
-        del state_dict
+    # Data is NOT sharded across ranks, so we do NOT divide eval_tokens by
+    # world_size. Cap ensemble_eval_steps at the loader's num_steps to avoid
+    # epoch wraparound (which would reshuffle data mid-eval).
+    val_loader = DDPValLoader(val_path, B_eval, MAX_SEQ_LEN,
+                              rank=0, world_size=1, device=device, seed=0)
+    requested_steps = max(1, EVAL_TOKENS // (B_eval * MAX_SEQ_LEN))
+    ensemble_eval_steps = min(requested_steps, val_loader.num_steps)
+    BT = B_eval * MAX_SEQ_LEN
 
-    # Use B=1 for ensemble eval to save memory (N models loaded simultaneously)
-    B_ensemble = 1
-    val_loader = DataLoader(
-        args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt"),
-        B_ensemble, MAX_SEQ_LEN, device=device, seed=0,
-    )
-    _, _, _, ddp_world_size = get_dist_info()
-    ensemble_eval_steps = EVAL_TOKENS // (B_ensemble * MAX_SEQ_LEN * ddp_world_size)
+    print0(f"  Ensemble eval: {num_models} model(s), "
+           f"this rank owns {my_count} in {n_chunks} chunk(s) of <={max_mem}, "
+           f"{ensemble_eval_steps} steps of B={B_eval}")
 
-    total_nats = torch.tensor(0.0, dtype=torch.float64, device=device)
-    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
-    total_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
-    total_tokens = torch.tensor(0, dtype=torch.int64, device=device)
-
-    batch_iter = iter(val_loader)
+    # --- Pass 1: cache per-step targets (no forward passes) ---------------
+    val_loader.pos = 0
+    flat_y_per_step = []
     for _ in range(ensemble_eval_steps):
-        x, y, _ = next(batch_iter)
-        flat_y = y.view(-1)
+        _, y, _ = next(val_loader)
+        flat_y_per_step.append(y.view(-1).clone())
 
-        # Average target probabilities across all models
-        target_prob_sum = torch.zeros(flat_y.size(0), dtype=torch.float64, device=device)
-        for model in ensemble_models:
-            with autocast_ctx:
-                logits = model.forward_logits(x).float()
-            probs = F.softmax(logits.view(-1, logits.size(-1)), dim=-1)
-            target_prob_sum += probs.gather(1, flat_y.clamp(min=0).unsqueeze(-1)).squeeze(-1).double()
-            del logits, probs
-        avg_prob = target_prob_sum / num_models
+    # --- Load a single checkpoint into a fresh GPT on this device ---------
+    def _load_one(ckpt_path):
+        with torch.device("meta"):
+            m = GPT(config)
+        m.to_empty(device=device)
+        m.init_weights(convert_embed=False)
+        sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+        m.load_state_dict(sd)
+        m.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
+        m.eval()
+        del sd
+        return m
 
-        # Compute loss as -log(avg_prob)
-        loss_per_pos = -torch.log(avg_prob + 1e-10)
+    # --- Per-rank partial sum of p(y_t) over this rank's owned models -----
+    # Float32 is fine: values are in [0, 1]; summing up to max_mem per chunk
+    # then across chunks well within fp32 precision.
+    my_psum = torch.zeros(ensemble_eval_steps, BT, dtype=torch.float32, device=device)
+
+    def _forward_pgt(model, x, flat_targets):
+        with autocast_ctx:
+            logits = model.forward_logits(x).float()
+        flat_logits = logits.view(-1, logits.size(-1))
+        logit_gt = flat_logits.gather(1, flat_targets.unsqueeze(1)).squeeze(1)
+        log_denom = torch.logsumexp(flat_logits, dim=-1)
+        return torch.exp(logit_gt - log_denom)
+    compiled_forward_pgt = torch.compile(_forward_pgt, dynamic=False)
+
+    # --- Pass 2: chunked forward passes, streaming sum into my_psum -------
+    for chunk_idx, chunk_start in enumerate(range(0, my_count, max_mem)):
+        chunk_paths = my_paths[chunk_start:chunk_start + max_mem]
+        chunk_models = [_load_one(p) for p in chunk_paths]
+
+        val_loader.pos = 0  # replay deterministically
+        for step_idx in range(ensemble_eval_steps):
+            x, y, _ = next(val_loader)
+            flat_y_clamped = y.view(-1).clamp(min=0)
+            for m in chunk_models:
+                my_psum[step_idx] += compiled_forward_pgt(m, x, flat_y_clamped)
+
+        del chunk_models
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        print0(f"  Chunk {chunk_idx + 1}/{n_chunks} done "
+               f"(local models {chunk_start + 1}-{chunk_start + len(chunk_paths)})")
+
+    # --- Pass 3: reduce across ranks, compute per-subset loss -------------
+    if dist.is_initialized() and world_size > 1:
+        dist.all_reduce(my_psum, op=dist.ReduceOp.SUM)
+
+    total_nats   = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_bytes  = torch.tensor(0,   dtype=torch.int64,   device=device)
+    total_loss   = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_tokens = torch.tensor(0,   dtype=torch.int64,   device=device)
+
+    for step_idx in range(ensemble_eval_steps):
+        flat_y = flat_y_per_step[step_idx]
+        p_avg = my_psum[step_idx] / num_models
+        loss_per_pos = -torch.log(p_avg.clamp(min=1e-12))
 
         mask = flat_y != -1
-        total_loss += loss_per_pos[mask].sum()
+        total_loss   += loss_per_pos[mask].sum().double()
         total_tokens += mask.sum()
 
         num_bytes2d = token_bytes[flat_y.clamp(min=0)]
-        total_nats += (loss_per_pos[mask] * (num_bytes2d[mask] > 0).double()).sum()
+        total_nats  += (loss_per_pos[mask] * (num_bytes2d[mask] > 0).double()).sum()
         total_bytes += num_bytes2d[mask].sum()
 
-        del target_prob_sum, avg_prob
+    total_nats_f   = total_nats.item()
+    total_bytes_f  = total_bytes.item()
+    total_loss_f   = total_loss.item()
+    total_tokens_f = total_tokens.item()
 
-    # Cleanup all models
-    del ensemble_models
+    bpb  = total_nats_f / (math.log(2) * total_bytes_f) if total_bytes_f  > 0 else float('inf')
+    loss = total_loss_f / total_tokens_f                 if total_tokens_f > 0 else float('inf')
+
+    del my_psum, flat_y_per_step, val_loader
+    gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    if dist.is_initialized():
-        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
-
-    total_nats, total_bytes = total_nats.item(), total_bytes.item()
-    total_loss, total_tokens = total_loss.item(), total_tokens.item()
-    bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
-    loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
     return bpb, loss
 
 
@@ -894,6 +1123,10 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     immediately preceding model (chain distillation). Only one teacher is loaded
     at a time, keeping memory usage constant regardless of ensemble size.
 
+    MTP auxiliary loss (on hard next-next tokens) is added on top of both the
+    standard and distillation losses when args.mtp_weight > 0. The teacher is
+    not used for MTP — only the student's own next-next-token prediction.
+
     After training, EMA-blended weights are evaluated and the best weights
     (final or blended) are saved to the checkpoint.
     """
@@ -978,6 +1211,8 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
     smooth_train_loss = 0
     smooth_train_hard_loss = 0  # EMA for hard CE component
     smooth_train_kl_loss = 0    # EMA for KL distillation component
+    smooth_train_lm_loss = 0    # EMA for standard-path lm CE
+    smooth_train_mtp_loss = 0   # EMA for MTP aux loss
     total_training_time = 0
     eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 
@@ -987,6 +1222,8 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         print0(f"  [model {model_idx+1}] Loading {len(teacher_checkpoint_paths)} teacher model(s) for distillation...")
         teacher_models = load_teacher_models(teacher_checkpoint_paths, config, device)
         print0(f"  [model {model_idx+1}] Teachers loaded.")
+
+    mtp_on = args.mtp_weight > 0
 
     # Enable GC for fresh model
     gc.enable()
@@ -1015,15 +1252,17 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
         t0 = time.time()
         train_hard_loss = None
         train_kl_loss = None
+        train_lm_loss = None
+        train_mtp_loss = None
         for micro_step in range(grad_accum_steps):
             if teacher_models:
-                # --- Chain distillation loss ---
+                # --- Chain distillation loss (MTP folded into the "normal loss") ---
                 with torch.inference_mode():
                     with autocast_ctx:
                         teacher_logits = teacher_models[0].forward_logits(x).float()
 
                 with autocast_ctx:
-                    student_logits = compiled_model(x)
+                    student_logits, mtp_loss = compiled_model(x, y, distill=True)
 
                 flat_s = student_logits.view(-1, student_logits.size(-1))
                 flat_t = teacher_logits.view(-1, teacher_logits.size(-1))
@@ -1039,14 +1278,26 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
                     reduction='batchmean',
                 ) * (T * T)
 
-                loss = (1 - args.distill_alpha) * hard_loss + args.distill_alpha * kl_loss
+                # Fold MTP into the "normal loss" side so it participates in the
+                # α trade-off instead of sitting outside it. Matches the
+                # non-distillation path, where forward() returns lm + mtp_weight*mtp.
+                normal_loss = hard_loss
+                if mtp_on:
+                    normal_loss = normal_loss + args.mtp_weight * mtp_loss
+                    train_mtp_loss = mtp_loss.detach()
+                loss = (1 - args.distill_alpha) * normal_loss + args.distill_alpha * kl_loss
                 train_hard_loss = hard_loss.detach()
                 train_kl_loss = kl_loss.detach()
                 del teacher_logits
             else:
-                # --- Standard cross-entropy loss ---
+                # --- Standard loss (+ MTP aux if enabled) ---
                 with autocast_ctx:
-                    loss = compiled_model(x, y)
+                    out = compiled_model(x, y)
+                # With targets + reduction='mean', forward always returns (loss, metrics)
+                loss, metrics = out
+                train_lm_loss = metrics['lm_loss'].detach()
+                if mtp_on and 'mtp_loss' in metrics:
+                    train_mtp_loss = metrics['mtp_loss'].detach()
 
             train_loss = loss.detach()
             (loss / grad_accum_steps).backward()
@@ -1102,6 +1353,18 @@ def train_single_model(model_idx, seed, device, config, autocast_ctx, token_byte
             debiased_kl   = smooth_train_kl_loss   / (1 - ema_beta**step)
             log_dict[f"model_{model_idx+1}/train_hard_loss"] = debiased_hard
             log_dict[f"model_{model_idx+1}/train_kl_loss"]   = debiased_kl
+
+        # Log standard-path lm loss
+        if train_lm_loss is not None:
+            smooth_train_lm_loss = ema_beta * smooth_train_lm_loss + (1 - ema_beta) * train_lm_loss.item()
+            debiased_lm = smooth_train_lm_loss / (1 - ema_beta**step)
+            log_dict[f"model_{model_idx+1}/train_lm_loss"] = debiased_lm
+
+        # Log MTP train loss (both paths, when MTP is on)
+        if train_mtp_loss is not None:
+            smooth_train_mtp_loss = ema_beta * smooth_train_mtp_loss + (1 - ema_beta) * train_mtp_loss.item()
+            debiased_mtp = smooth_train_mtp_loss / (1 - ema_beta**step)
+            log_dict[f"model_{model_idx+1}/train_mtp_loss"] = debiased_mtp
 
         wandb_run.log(log_dict)
 
@@ -1299,7 +1562,8 @@ def main():
             token_bytes_list.append(len(encoder.decode_single_token_bytes(i)))
     token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
-    config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+    config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
+                       use_iha=args.iha, iha_mix_v=args.iha)
 
     # Print config
     print0(f"\n{'='*60}")
@@ -1311,6 +1575,7 @@ def main():
     print0(f"  num_epochs_model_0={args.num_epochs_model_0}")
     print0(f"  dupe_layers={args.dupe_layers_start}-{args.dupe_layers_end} (last {100*(1-args.dupe_fraction):.0f}% of epochs)")
     print0(f"  ema_decays={args.ema_decays}, ema_start_frac={args.ema_start_frac}")
+    print0(f"  mtp_weight={args.mtp_weight}, iha={args.iha}, iha_lr={args.iha_lr}")
     print0(f"  checkpoint_dir={checkpoint_dir}")
     print0(f"{'='*60}")
 
@@ -1373,64 +1638,38 @@ def main():
         individual_results.append({"model": model_idx + 1, "seed": seeds[model_idx],
                                     "val_bpb": best_bpb, "val_loss": best_loss})
 
-        # Compute ensemble val loss using last 7 models (7 * ~7GB = ~49GB fits in 80GB GPU)
-        num_models_so_far = model_idx + 1
-        max_ensemble_gpu = 7
-        eval_paths = checkpoint_paths[-max_ensemble_gpu:] if len(checkpoint_paths) > max_ensemble_gpu else checkpoint_paths
-        print0(f"\nEvaluating ensemble of {len(eval_paths)} model(s) (of {num_models_so_far} total)...")
-
-        ens_bpb, ens_loss = evaluate_ensemble_bpb(
-            checkpoint_paths=eval_paths,
-            config=config,
-            token_bytes=token_bytes,
-            device=device,
-            autocast_ctx=autocast_ctx,
-        )
-
-        ensemble_results.append({"num_models": num_models_so_far, "ensemble_bpb": ens_bpb, "ensemble_loss": ens_loss})
-        print0(f"Ensemble ({num_models_so_far} models) | Val BPB: {ens_bpb:.6f} | Val Loss: {ens_loss:.6f}")
-        wandb_run.log({
-            "ensemble/num_models": num_models_so_far,
-            "ensemble/val_bpb": ens_bpb,
-            "ensemble/val_loss": ens_loss,
-        })
-        save_progress()
-
-        # Ensemble excluding model 0 — this is the reported ensemble metric,
-        # since model 0 (no distillation teacher, fewer epochs) hurts ensemble quality.
-        if len(checkpoint_paths) >= 2:
-            nf_paths = checkpoint_paths[1:]
-            if len(nf_paths) > max_ensemble_gpu:
-                nf_paths = nf_paths[-max_ensemble_gpu:]
-            ens_nf_bpb, ens_nf_loss = evaluate_ensemble_bpb(
-                checkpoint_paths=nf_paths,
+        # Evaluate ensemble of models 2..N (1-indexed), i.e. skip model 0 (the
+        # weak one: no distillation teacher, fewer epochs). For N=1 there is
+        # nothing to ensemble yet.
+        num_models_trained = model_idx + 1
+        if num_models_trained >= 2:
+            ens_paths = checkpoint_paths[1:]
+            num_in_ensemble = len(ens_paths)
+            print0(f"\nEvaluating ensemble of {num_in_ensemble} model(s) (models 2-{num_models_trained})...")
+            ens_bpb, ens_loss = evaluate_ensemble_bpb(
+                checkpoint_paths=ens_paths,
                 config=config,
                 token_bytes=token_bytes,
                 device=device,
                 autocast_ctx=autocast_ctx,
             )
-            num_no_first = len(checkpoint_paths) - 1
-            print0(f"Ensemble excl. model 0 ({num_no_first} models) | Val BPB: {ens_nf_bpb:.6f} | Val Loss: {ens_nf_loss:.6f}")
-            wandb_run.log({
-                "ensemble_no_first/num_models": num_no_first,
-                "ensemble_no_first/val_bpb": ens_nf_bpb,
-                "ensemble_no_first/val_loss": ens_nf_loss,
+            ensemble_results.append({
+                "num_models_trained": num_models_trained,
+                "num_models": num_in_ensemble,
+                "ensemble_bpb": ens_bpb,
+                "ensemble_loss": ens_loss,
             })
-
-    # Final ensemble evaluation: last 7 models (prob averaging)
-    max_ensemble_gpu = 7
-    final_paths = checkpoint_paths[-max_ensemble_gpu:]
-    print0(f"\n{'='*60}")
-    print0(f"Final ensemble eval: last {len(final_paths)} models (prob averaging)")
-    print0(f"{'='*60}")
-    final_bpb, final_loss = evaluate_ensemble_bpb(
-        checkpoint_paths=final_paths,
-        config=config,
-        token_bytes=token_bytes,
-        device=device,
-        autocast_ctx=autocast_ctx,
-    )
-    print0(f"  Val BPB: {final_bpb:.6f} | Val Loss: {final_loss:.6f}")
+            print0(f"Ensemble of {num_in_ensemble} (models 2-{num_models_trained}) | "
+                   f"Val BPB: {ens_bpb:.6f} | Val Loss: {ens_loss:.6f}")
+            wandb_run.log({
+                "ensemble/num_models": num_in_ensemble,
+                "ensemble/num_models_trained": num_models_trained,
+                "ensemble/val_bpb": ens_bpb,
+                "ensemble/val_loss": ens_loss,
+            })
+        else:
+            print0(f"\nSkipping ensemble eval (only {num_models_trained} model trained — need >= 2).")
+        save_progress()
 
     # Final summary
     print0(f"\n{'='*60}")
@@ -1439,19 +1678,24 @@ def main():
     print0(f"\nIndividual model results:")
     for r in individual_results:
         print0(f"  Model {r['model']} (seed {r['seed']}): BPB={r['val_bpb']:.6f}, Loss={r['val_loss']:.6f}")
-    print0(f"\nRunning ensemble results:")
+    print0(f"\nRunning ensemble results (models 2..N):")
     for r in ensemble_results:
-        print0(f"  Ensemble ({r['num_models']} models): BPB={r['ensemble_bpb']:.6f}, Loss={r['ensemble_loss']:.6f}")
-    print0(f"\n*** Final result (last {len(final_paths)} models, prob avg): BPB={final_bpb:.6f} | Val Loss={final_loss:.6f} ***")
+        print0(f"  After model {r['num_models_trained']}: ensemble of {r['num_models']} | "
+               f"BPB={r['ensemble_bpb']:.6f}, Loss={r['ensemble_loss']:.6f}")
+    if ensemble_results:
+        last = ensemble_results[-1]
+        print0(f"\n*** Final result (ensemble of {last['num_models']} models): "
+               f"BPB={last['ensemble_bpb']:.6f} | Val Loss={last['ensemble_loss']:.6f} ***")
 
     # Save results
     if args.save_result and master_process:
         result = {
             "individual_models": individual_results,
             "ensemble_results": ensemble_results,
-            "final_ensemble_bpb": final_bpb,
-            "final_ensemble_loss": final_loss,
         }
+        if ensemble_results:
+            result["final_ensemble_bpb"] = ensemble_results[-1]["ensemble_bpb"]
+            result["final_ensemble_loss"] = ensemble_results[-1]["ensemble_loss"]
         with open(args.save_result, "w") as f:
             json.dump(result, f, indent=2)
         print0(f"Results saved to {args.save_result}")
