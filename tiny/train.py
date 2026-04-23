@@ -9,11 +9,16 @@ Usage:
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TORCH_LOGS"] = "recompiles"
 import gc
 import math
 import time
 import json
 import argparse
+import sys
+import secrets
+import shutil
+import string
 from types import SimpleNamespace
 from functools import partial
 from dataclasses import dataclass
@@ -39,7 +44,8 @@ parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=32)
 parser.add_argument("--num-epochs", type=int, default=16)
 parser.add_argument("--patience", type=int, default=-1)
-parser.add_argument("--run", type=str, default=None)
+parser.add_argument("--run-name", type=str, default=None,
+                    help="Run name under runs/ (default: random 6-char string)")
 parser.add_argument("--scalar-lr", type=float, default=0.25)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
@@ -55,7 +61,6 @@ parser.add_argument("--wd-mid", type=float, default=0.1)
 parser.add_argument("--wd-end", type=float, default=1.25)
 parser.add_argument("--warmdown-ratio", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
-parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
@@ -69,45 +74,26 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
-args = parser.parse_args()
-
-# Resolve output path
-if args.output_json and not args.save_result:
-    args.save_result = args.output_json
+parser.add_argument("--varlen", action="store_true",
+                    help="Use variable-length attention (no cross-document context)")
+parser.add_argument("--stride", type=int, default=512,
+                    help="Stride for sliding-window eval; 0 to disable (default: 512)")
 
 # =============================================================================
-# Hyperparameters
+# Default architecture constants (overridden by CLI when run as __main__)
 # =============================================================================
 
-# Architecture
-DEPTH = args.n_layer if args.n_layer is not None else 12
-N_EMBD = args.n_embd if args.n_embd is not None else 768
-N_HEAD = args.n_head if args.n_head is not None else 6
-HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
-TOTAL_BATCH_SIZE = args.total_batch_size
+DEPTH = 16
+N_EMBD = 1024
+N_HEAD = 8
+HEAD_DIM = N_EMBD // N_HEAD
 EVAL_TOKENS = 10_000_000
-DATA_DIR = "fineweb_data"
-
-# Base optimizer hyperparameters
-BASE_MATRIX_LR = args.matrix_lr
-BASE_SCALAR_LR = args.scalar_lr
-BASE_EMBEDDING_LR = args.embedding_lr
-BASE_UNEMBEDDING_LR = args.unembedding_lr
-
-# Apply LR multiplier if provided (scales all LRs uniformly)
-_lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
-MATRIX_LR = BASE_MATRIX_LR * _lr_mult
-UNEMBEDDING_LR = BASE_UNEMBEDDING_LR * _lr_mult
-EMBEDDING_LR = BASE_EMBEDDING_LR * _lr_mult
-SCALAR_LR = BASE_SCALAR_LR * _lr_mult
-
-WEIGHT_DECAY = args.weight_decay
-ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = args.warmdown_ratio
-FINAL_LR_FRAC = 0.0
+BOS_ID = 50256  # <|endoftext|>
+DATA_DIR = "fineweb_varlen_data"
+VARLEN_CU_BUCKET_SIZE = 64
+RUNS_DIR = "runs"
 
 # =============================================================================
 # Utilities
@@ -126,6 +112,29 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
+
+class TeeStream:
+    """Save terminal output to file."""
+    def __init__(self, *streams):
+        self.streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8")
+    def write(self, data):
+        for stream in self.streams: stream.write(data)
+        return len(data)
+    def flush(self):
+        for stream in self.streams: stream.flush()
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+    def fileno(self):
+        return self.streams[0].fileno()
+
+def resolve_run_dir(run_name):
+    if run_name:
+        actual_run_name = run_name
+    else:
+        alphabet = string.ascii_lowercase + string.digits
+        actual_run_name = "".join(secrets.choice(alphabet) for _ in range(6))
+    return actual_run_name, os.path.join(RUNS_DIR, actual_run_name)
 
 # =============================================================================
 # Flash Attention (FA3 on Hopper, SDPA fallback elsewhere)
@@ -175,6 +184,41 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
+
+def flash_attn_varlen_fn(q, k, v, cu_seqlens, max_seqlen, causal=False, window_size=(-1, -1)):
+    """Flash Attention varlen. q,k,v: (T, H, D) — no batch dim. Returns (T, H, D)."""
+    assert _fa3 is not None, "FA3 required for varlen attention"
+    return _fa3.flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+        causal=causal, window_size=window_size,
+    )
+
+
+def _build_cu_seqlens(bos_pos, total_len, device, max_doc_len=0, bucket_size=64):
+    """Build cu_seqlens from BOS positions, optionally splitting long segments."""
+    if not bos_pos or bos_pos[0] != 0:
+        bos_pos = [0] + bos_pos
+    seg_starts = []
+    starts_with_end = bos_pos + [total_len]
+    for i in range(len(starts_with_end) - 1):
+        start, end = starts_with_end[i], starts_with_end[i + 1]
+        if max_doc_len > 0:
+            pos = start
+            while pos < end:
+                seg_starts.append(pos)
+                pos += max_doc_len
+        else:
+            seg_starts.append(start)
+    boundaries = seg_starts + [total_len]
+    padded_len = ((len(boundaries) + bucket_size - 1) // bucket_size) * bucket_size
+    cu = torch.full((padded_len,), total_len, dtype=torch.int32, device=device)
+    cu[:len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
+    seg_ends = seg_starts[1:] + [total_len]
+    max_seqlen = max(end - start for start, end in zip(seg_starts, seg_ends))
+    return cu, max_seqlen
+
 # =============================================================================
 # GPT Model
 # =============================================================================
@@ -189,6 +233,7 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1
+    device_batch_size: int = 32
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -226,7 +271,7 @@ class CausalSelfAttention(nn.Module):
         char = pattern[layer_idx % len(pattern)]
         self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, cu_seqlens=None, max_seqlen=0):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -241,8 +286,25 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
         # Partial key offset: shift stationary dims forward by 1 on long-window layers
         if self.use_key_offset and T > 1:
-            k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:].clone()
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            stationary = k[..., self.head_dim // 2:].clone()
+            k[:, 1:, :, self.head_dim // 2:] = stationary[:, :-1]
+            if cu_seqlens is not None:
+                # Reset at varlen boundaries so each segment starts from its own token.
+                # Use fixed-shape ops to avoid data-dependent shapes that break torch.compile.
+                all_b = cu_seqlens[1:].long()
+                is_real = (all_b > 0) & (all_b < T)
+                safe_idx = torch.where(is_real, all_b, torch.zeros_like(all_b))
+                boundary_mask = torch.zeros(T, device=k.device, dtype=torch.bool)
+                boundary_mask.scatter_(0, safe_idx, is_real)
+                bm = boundary_mask[None, :, None, None]
+                k[..., self.head_dim // 2:] = torch.where(bm, stationary, k[..., self.head_dim // 2:])
+        if cu_seqlens is not None:
+            y = flash_attn_varlen_fn(
+                q[0], k[0], v[0], cu_seqlens, max_seqlen,
+                causal=True, window_size=window_size,
+            )[None]
+        else:
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -267,8 +329,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, cu_seqlens=None, max_seqlen=0):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, cu_seqlens, max_seqlen)
         x = x + self.mlp(norm(x))
         return x
 
@@ -294,7 +356,7 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
-        self.rotary_seq_len = config.sequence_len * 10
+        self.rotary_seq_len = config.device_batch_size * config.sequence_len
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -400,7 +462,8 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', cu_seqlens=None, max_seqlen=0):
+        # Can encode abs position in batch for varlen bc RoPE is relative.
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
@@ -412,7 +475,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * skip
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x = block(x, ve, cos_sin, self.window_sizes[i], cu_seqlens, max_seqlen)
             if i < self.encoder_layers:
                 skip_connections.append(x)
         x = norm(x)
@@ -602,67 +665,101 @@ class DistMuonAdamW(torch.optim.Optimizer):
             if info.get("params") is not None:
                 torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
 # =============================================================================
-# Dataloader: BOS-aligned best-fit packing
+# Dataloaders
 # =============================================================================
 
-class DataLoader:
-    """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
+class VarlenDataLoader:
+    """Flat-token loader for varlen attention with document-level shuffling."""
 
-    def __init__(self, filepath, B, T, device="cuda"):
+    def __init__(self, filepath, B, T, device="cuda", *, shuffle=True,
+                 varlen=True, cu_bucket_size=VARLEN_CU_BUCKET_SIZE):
         data = torch.load(filepath, weights_only=True)
-        chunks = data['chunks']
-        valid_counts = data['valid_counts']
-        file_B = data['batch_size']
-        sequence_size = data['sequence_size']
-        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
+        if "tokens" not in data or "doc_starts" not in data:
+            raise ValueError(
+                f"{filepath} is not a varlen data file; expected keys 'tokens' and 'doc_starts'"
+            )
+        all_tokens = data["tokens"].long()
+        raw_doc_starts = data["doc_starts"].long()
+        bos_id = int(data["bos_id"])
+        assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
 
-        # Gather all valid sequences into one tensor
-        all_seqs = []
-        for chunk, vc in zip(chunks, valid_counts):
-            rows = chunk.view(file_B, sequence_size)[:vc]
-            all_seqs.append(rows)
-        all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
+        # Extract individual documents
+        n_docs = raw_doc_starts.numel()
+        doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
+        self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
 
-        # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
-        seqs_per_step = B * world_size
-        num_steps = len(all_seqs) // seqs_per_step
-        usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
-
-        self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
-        self.num_steps = num_steps
-        self.total_tokens = usable * T  # trainable tokens across all ranks
+        self.rank = rank
+        self.world_size = world_size
         self.device = device
-        self.pos = 0
+        self.B = B
+        self.T = T
+        self.varlen = varlen
+        self.shuffle = shuffle
+        self.cu_bucket_size = cu_bucket_size
+        self.tokens_per_rank = B * T
+        self.per_rank_span = self.tokens_per_rank + 1
+        self.global_span = self.per_rank_span * world_size
+        self.total_tokens_available = all_tokens.numel()
         self.epoch = 1
+        self._build_stream()
+
+    def _build_stream(self):
+        """Concatenate documents (in current order) into a flat stream."""
+        self.tokens = torch.cat(self.doc_tokens)
+        # Recompute doc_starts from doc lengths
+        lengths = torch.tensor([d.numel() for d in self.doc_tokens], dtype=torch.int64)
+        self.doc_starts = torch.zeros(len(self.doc_tokens), dtype=torch.int64)
+        torch.cumsum(lengths[:-1], dim=0, out=self.doc_starts[1:])
+        self.num_steps = self.tokens.numel() // self.global_span
+        self.total_tokens = self.num_steps * self.tokens_per_rank * self.world_size
+        self.pos = 0
 
     def __iter__(self):
         return self
 
-    def _shuffle(self):
-        """Shuffle batch order for the new epoch, consistent across ranks."""
+    def _shuffle_docs(self):
+        if not self.shuffle:
+            return
         g = torch.Generator()
         g.manual_seed(self.epoch)
-        perm = torch.randperm(self.num_steps, generator=g)
-        self.rank_data = self.rank_data[perm]
+        perm = torch.randperm(len(self.doc_tokens), generator=g)
+        self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
+        self._build_stream()
+
+    def _local_doc_starts(self, start):
+        end = start + self.tokens_per_rank
+        lo = torch.searchsorted(self.doc_starts, torch.tensor(start, dtype=torch.int64), right=False).item()
+        hi = torch.searchsorted(self.doc_starts, torch.tensor(end, dtype=torch.int64), right=False).item()
+        return (self.doc_starts[lo:hi] - start).tolist()
 
     def __next__(self):
         if self.pos >= self.num_steps:
             self.pos = 0
             self.epoch += 1
             print0(f"Starting epoch {self.epoch}")
-            self._shuffle()
-        batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
+            self._shuffle_docs()
+        batch_start = self.pos * self.global_span
         self.pos += 1
-        return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
+        local_start = batch_start + self.rank * self.per_rank_span
+        buf = self.tokens[local_start:local_start + self.per_rank_span]
+        x = buf[:-1].to(self.device, non_blocking=True)
+        y = buf[1:].to(self.device, non_blocking=True)
+        if self.varlen:
+            starts = self._local_doc_starts(local_start)
+            cu_seqlens, _ = _build_cu_seqlens(
+                starts, self.tokens_per_rank, x.device,
+                max_doc_len=self.T, bucket_size=self.cu_bucket_size,
+            )
+            return x[None], y[None], cu_seqlens, self.T, self.epoch
+        return x.view(self.B, self.T), y.view(self.B, self.T), None, self.T, self.epoch
 
 # =============================================================================
 # Loss evaluation
 # =============================================================================
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb(model, batches, steps, token_bytes, varlen=False):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
@@ -670,8 +767,12 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
-        x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none').view(-1)
+        x, y, cu_seqlens, max_seqlen, _ = next(batch_iter)
+        if varlen:
+            loss2d = model(x, y, loss_reduction='none',
+                           cu_seqlens=cu_seqlens, max_seqlen=max_seqlen).view(-1)
+        else:
+            loss2d = model(x, y, loss_reduction='none').view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -690,333 +791,518 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
     return bpb, loss
 
+
+@torch.no_grad()
+def evaluate_bpb_strided(model, val_tokens_path, token_bytes, stride, seq_len,
+                         batch_size, device, varlen=False):
+    """Sliding-window BPB: each token scored with up to seq_len context.
+
+    Slides a window of `seq_len` across the flat val token stream with the given
+    stride.  Only the last `stride` tokens of each window are scored (they see
+    full seq_len context).  Windows are sharded across DDP ranks.
+
+    If varlen=True, builds per-window cu_seqlens from doc_starts so attention
+    does not cross document boundaries.
+    """
+    data = torch.load(val_tokens_path, weights_only=True)
+    tokens = data["tokens"].long()
+    doc_starts = data["doc_starts"].long() if varlen else None
+    n = tokens.numel()
+    if n <= seq_len:
+        return float('inf'), float('inf')
+
+    starts = list(range(0, n - seq_len, stride))
+    _, rank, _, world_size = get_dist_info()
+    my_starts = starts[rank::world_size]
+
+    total_nats = torch.tensor(0.0, dtype=torch.float64, device=device)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+    total_tokens = torch.tensor(0, dtype=torch.int64, device=device)
+
+    for i in range(0, len(my_starts), batch_size):
+        chunk = my_starts[i:i + batch_size]
+        if len(chunk) < batch_size:
+            break
+        x = torch.stack([tokens[s:s + seq_len] for s in chunk]).to(device)
+        y = torch.stack([tokens[s + 1:s + seq_len + 1] for s in chunk]).to(device)
+        B_actual = len(chunk)
+        if varlen:
+            losses = []
+            for b_idx in range(B_actual):
+                s = chunk[b_idx]
+                lo = torch.searchsorted(doc_starts, torch.tensor(s, dtype=torch.int64), right=False).item()
+                hi = torch.searchsorted(doc_starts, torch.tensor(s + seq_len, dtype=torch.int64), right=False).item()
+                local_starts = (doc_starts[lo:hi] - s).tolist()
+                cu, _ = _build_cu_seqlens(local_starts, seq_len, device,
+                                          max_doc_len=seq_len, bucket_size=VARLEN_CU_BUCKET_SIZE)
+                loss_1d = model(x[b_idx:b_idx+1], y[b_idx:b_idx+1],
+                                loss_reduction='none',
+                                cu_seqlens=cu, max_seqlen=seq_len)
+                losses.append(loss_1d.view(seq_len))
+            loss_2d = torch.stack(losses)
+        else:
+            loss_2d = model(x, y, loss_reduction='none').view(B_actual, seq_len)
+        scored = loss_2d[:, -stride:]
+        scored_y = y[:, -stride:]
+        total_nats += scored.double().sum()
+        total_bytes += token_bytes[scored_y].sum()
+        total_tokens += scored.numel()
+
+    if dist.is_initialized():
+        for t in (total_nats, total_bytes, total_tokens):
+            dist.all_reduce(t)
+
+    bpb = (total_nats / total_bytes.double() / math.log(2)).item()
+    loss = (total_nats / total_tokens.double()).item()
+    return bpb, loss
+
+
 # =============================================================================
 # Training
 # =============================================================================
 
-# Compute init
-ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-master_process = ddp_rank == 0
-torch.manual_seed(42)
+if __name__ == "__main__":
+    args = parser.parse_args()
 
-if ddp and torch.cuda.is_available():
-    device = torch.device("cuda", ddp_local_rank)
-    torch.cuda.set_device(device)
-    torch.cuda.manual_seed(42)
-    dist.init_process_group(backend="nccl", device_id=device)
-    dist.barrier()
-else:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Resolve output path
+    # Override architecture constants from CLI
+    DEPTH = args.n_layer if args.n_layer is not None else DEPTH
+    N_EMBD = args.n_embd if args.n_embd is not None else N_EMBD
+    N_HEAD = args.n_head if args.n_head is not None else N_HEAD
+    HEAD_DIM = N_EMBD // N_HEAD
+    TOTAL_BATCH_SIZE = args.total_batch_size
 
-device_type = device.type
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+    # Optimizer hyperparameters
+    _lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
+    MATRIX_LR = args.matrix_lr * _lr_mult
+    SCALAR_LR = args.scalar_lr * _lr_mult
+    EMBEDDING_LR = args.embedding_lr * _lr_mult
+    UNEMBEDDING_LR = args.unembedding_lr * _lr_mult
+    WEIGHT_DECAY = args.weight_decay
+    ADAM_BETAS = (0.8, 0.95)
+    WARMUP_RATIO = 0.0
+    WARMDOWN_RATIO = args.warmdown_ratio
+    FINAL_LR_FRAC = 0.0
 
-# GPU info for MFU
-gpu_peak_flops = float('inf')
-if device_type == "cuda":
-    gpu_name = torch.cuda.get_device_name(0).lower()
-    if "h100" in gpu_name: gpu_peak_flops = 989e12
-    elif "a100" in gpu_name: gpu_peak_flops = 312e12
-    elif "4090" in gpu_name: gpu_peak_flops = 165.2e12
+    # Compute init
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    master_process = ddp_rank == 0
+    torch.manual_seed(42)
 
-# FA3 status
-if _fa3 is not None:
-    print0("Using Flash Attention 3 (Hopper GPU detected)")
-else:
-    print0("Using PyTorch SDPA fallback (no FA3)")
-
-# wandb
-run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
-_wandb_kwargs = {"project": "slowrun", "name": run_name}
-if args.wandb_group:
-    _wandb_kwargs["group"] = args.wandb_group
-wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
-if master_process:
-    wandb_run.log_code(".")
-
-# Print hyperparameters
-print0(f"--- Hyperparameters ---")
-print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
-print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
-print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
-print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
-print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
-print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
-print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
-print0(f"  dropout={args.dropout}")
-print0(f"-----------------------")
-
-# Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
-encoder = tiktoken.get_encoding("gpt2")
-vocab_size = encoder.n_vocab  # 50257
-print0(f"Vocab size: {vocab_size:,}")
-
-eot_id = encoder._special_tokens['<|endoftext|>']
-token_bytes_list = []
-for i in range(vocab_size):
-    if i == eot_id:
-        token_bytes_list.append(0)
-    else:
-        token_bytes_list.append(len(encoder.decode_single_token_bytes(i)))
-token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
-
-# Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
-
-param_counts = sum(p.numel() for p in model.parameters())
-transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
-ve_params = sum(p.numel() for p in model.ve_projs.parameters())
-lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
-other_params = param_counts - transformer_params - ve_params - lm_head_params
-num_flops_per_token = model.estimate_flops()
-print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
-print0(f"FLOPs per token: {num_flops_per_token:e}")
-
-# Compile
-orig_model = model
-model = torch.compile(model, dynamic=False)
-
-# Optimizer
-optimizer = model.setup_optimizer()
-
-# Dataloaders
-_train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
-_val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
-build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
-TOKENS_PER_EPOCH = train_loader.total_tokens
-x, y, current_epoch = next(train_loader)
-
-# Training config
-tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
-# Convert epoch boundaries to steps (must happen after num_iterations is known)
-wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_iterations)
-wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iterations)
-print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
-print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
-print0(f"Eval set: {EVAL_TOKENS:,} tokens")
-
-# Schedulers
-def get_lr_multiplier(it):
-    warmup = round(WARMUP_RATIO * num_iterations)
-    warmdown = round(WARMDOWN_RATIO * num_iterations)
-    if it < warmup: return (it + 1) / warmup
-    elif it <= num_iterations - warmdown: return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown
-        return progress + (1 - progress) * FINAL_LR_FRAC
-
-def get_muon_momentum(it):
-    return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
-
-# Training loop
-step = 0
-min_val_bpb = float("inf")
-min_val_loss = float("inf")
-epochs_without_improvement = 0
-smooth_train_loss = 0
-total_training_time = 0
-eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
-steps_per_epoch = num_iterations / args.num_epochs
-param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
-ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
-
-wall_clock_start = time.time()
-_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
-late_ckpt_paths = []
-
-# Initial val evaluation
-model.eval()
-val_loader = build_val_loader()
-with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
-min_val_bpb = val_bpb
-min_val_loss = val_loss
-model.train()
-
-while current_epoch <= args.num_epochs:
-    # Training step
-    synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
-        x, y, epoch = next(train_loader)
-
-    # Update optimizer
-    lrm = get_lr_multiplier(step)
-    # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
-    if _swa_start_step >= 0 and step >= _swa_start_step:
-        cycle_pos = (step - _swa_start_step) % steps_per_epoch
-        swa_base = max(lrm, 0.05)
-        lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
-    # WD schedule:
-    #   [0, wd_phase1_end_step]:              hold at weight_decay
-    #   [wd_phase1_end_step, wd_phase2_end_step]: decay to wd_mid
-    #   [wd_phase2_end_step, num_iterations]:     ramp up to wd_end
-    wd = np.interp(step,
-        [0, wd_phase1_end_step, wd_phase2_end_step, num_iterations],
-        [args.weight_decay, args.weight_decay, args.wd_mid, args.wd_end])
-    # Convert to a scale factor;
-    # groups with weight_decay=0.0 (scalar params) correctly stay at zero.
-    wd_scale = wd / args.weight_decay if args.weight_decay > 0 else 0.0
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if "initial_wd" not in group:
-            group["initial_wd"] = group.get("weight_decay", 0.0)
-        group["weight_decay"] = group["initial_wd"] * wd_scale
-        if group['kind'] == 'muon':
-            group["momentum"] = get_muon_momentum(step)
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
-    if ema_params is not None and step % args.update_ema_every == 0:
-        torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
-    train_loss_f = train_loss.item()
-    synchronize()
-    dt = time.time() - t0
-
-    step += 1
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased = smooth_train_loss / (1 - ema_beta**step)
-    pct = 100 * step / num_iterations
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
-    if step > 3:
-        total_training_time += dt
-    steps_done = step - 3
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
-
-    # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
-    if ddp:
-        epoch_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
-        dist.all_reduce(epoch_tensor, op=dist.ReduceOp.MAX)
-        epoch = epoch_tensor.item()
-
-    # Epoch boundary: evaluate when the dataloader advances to a new epoch
-    if epoch != current_epoch:
-        model.eval()
-        val_loader = build_val_loader()
-        with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
-        # Save checkpoint for weight averaging
-        ckpt_path = os.path.join("tiny_ckpts", f"epoch_{current_epoch:03d}.pt")
-        if master_process:
-            os.makedirs("tiny_ckpts", exist_ok=True)
-            torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, ckpt_path)
-        late_ckpt_paths.append(ckpt_path)
-        if len(late_ckpt_paths) > args.swa_last_epochs:
-            old = late_ckpt_paths.pop(0)
-            if master_process and os.path.exists(old): os.remove(old)
-        # Early stopping
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-            min_val_loss = val_loss
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if args.patience >= 0 and epochs_without_improvement >= args.patience:
-                print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
-                break
-
-        model.train()
-        current_epoch = epoch
-
-    # GC management
-    if step == 1:
-        gc.collect(); gc.freeze(); gc.disable()
-
-# Final EMA evaluation
-if ema_params is not None:
-    ema_updates = step // args.update_ema_every
-    if ema_updates > 0:
-        correction = 1.0 / (1.0 - param_ema_beta ** ema_updates)
-        model.eval()
-        with torch.no_grad():
-            for p, ema in zip(model.parameters(), ema_params):
-                p.copy_(ema * correction)
-        val_loader = build_val_loader()
-        with autocast_ctx:
-            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
-        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
-        val_bpb = ema_bpb
-        val_loss = ema_loss
-        if ema_bpb < min_val_bpb:
-            min_val_bpb = ema_bpb
-            min_val_loss = ema_loss
-
-# Checkpoint weight averaging (recency-weighted)
-if len(late_ckpt_paths) >= 2:
-    if ddp: dist.barrier()
-    n = len(late_ckpt_paths)
-    raw_w = list(range(1, n + 1))
-    weights = [w / sum(raw_w) for w in raw_w]
-    if master_process:
-        ckpts = [torch.load(p, map_location="cpu", weights_only=True) for p in late_ckpt_paths]
-        merged = {name: sum(w * ckpts[i][name].float() for i, w in enumerate(weights)) for name in ckpts[0]}
-        with torch.no_grad():
-            for name, p in orig_model.named_parameters():
-                if name in merged: p.copy_(merged[name].to(p.device, p.dtype))
-    if ddp:
+    if ddp and torch.cuda.is_available():
+        device = torch.device("cuda", ddp_local_rank)
+        torch.cuda.set_device(device)
+        torch.cuda.manual_seed(42)
+        dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
-        for p in orig_model.parameters(): dist.broadcast(p.data, src=0)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    device_type = device.type
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+    get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+
+    # GPU info for MFU
+    gpu_peak_flops = float('inf')
+    if device_type == "cuda":
+        gpu_name = torch.cuda.get_device_name(0).lower()
+        if "h100" in gpu_name: gpu_peak_flops = 989e12
+        elif "a100" in gpu_name: gpu_peak_flops = 312e12
+        elif "4090" in gpu_name: gpu_peak_flops = 165.2e12
+
+    # FA3 status
+    if _fa3 is not None:
+        print0("Using Flash Attention 3 (Hopper GPU detected)")
+    else:
+        print0("Using PyTorch SDPA fallback (no FA3)")
+
+    # Run / logging paths
+    run_name, run_dir = resolve_run_dir(args.run_name)
+    if dist.is_initialized():
+        shared = [run_name]
+        dist.broadcast_object_list(shared, src=0)
+        run_name = shared[0]
+        run_dir = os.path.join(RUNS_DIR, run_name)
+    checkpoints_dir = os.path.join(run_dir, "checkpoints")
+    artifact_model_path = os.path.join(run_dir, "model.pt")
+    terminal_log_path = os.path.join(run_dir, "terminal.log")
+    stdout_orig = sys.stdout
+    stderr_orig = sys.stderr
+    artifacts_log_f = None
+    result_path = os.path.join(run_dir, "result.json")
+    os.makedirs(run_dir, exist_ok=True)
+    if master_process:
+        os.makedirs(checkpoints_dir, exist_ok=True)
+        os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
+        shutil.copy2(__file__, os.path.join(run_dir, "train.py"))
+    if dist.is_initialized():
+        dist.barrier()
+    artifacts_log_f = open(terminal_log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = TeeStream(sys.stdout, artifacts_log_f)
+    sys.stderr = TeeStream(sys.stderr, artifacts_log_f)
+
+    # wandb
+    _wandb_kwargs = {"project": "slowrun", "name": run_name}
+    if args.wandb_group:
+        _wandb_kwargs["group"] = args.wandb_group
+    if run_dir:
+        _wandb_kwargs["dir"] = os.path.join(run_dir, "wandb")
+    wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
+    if master_process:
+        wandb_run.log_code(".")
+
+    # Print hyperparameters
+    print0(f"--- Hyperparameters ---")
+    print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
+    print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
+    print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
+    print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
+    print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
+    print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
+    print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
+    print0(f"  dropout={args.dropout}")
+    print0(f"  run={run_name}")
+    print0(f"  run_dir={run_dir}")
+    print0(f"  varlen={args.varlen}")
+    print0(f"-----------------------")
+
+    # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
+    encoder = tiktoken.get_encoding("gpt2")
+    vocab_size = encoder.n_vocab  # 50257
+    print0(f"Vocab size: {vocab_size:,}")
+
+    eot_id = encoder._special_tokens['<|endoftext|>']
+    token_bytes_list = []
+    for i in range(vocab_size):
+        if i == eot_id:
+            token_bytes_list.append(0)
+        else:
+            token_bytes_list.append(len(encoder.decode_single_token_bytes(i)))
+    token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
+
+    # Build model
+    config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size)
+    with torch.device("meta"):
+        model = GPT(config)
+    model.to_empty(device=device)
+    model.init_weights()
+
+    param_counts = sum(p.numel() for p in model.parameters())
+    transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
+    ve_params = sum(p.numel() for p in model.ve_projs.parameters())
+    lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
+    other_params = param_counts - transformer_params - ve_params - lm_head_params
+    num_flops_per_token = model.estimate_flops()
+    print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
+    print0(f"FLOPs per token: {num_flops_per_token:e}")
+
+    # Compile
+    orig_model = model
+    model = torch.compile(model, dynamic=False, fullgraph=True)
+
+    default_train_path = os.path.join(DATA_DIR, "fineweb_train_varlen.pt")
+    default_val_path = os.path.join(DATA_DIR, "fineweb_val_varlen.pt")
+    build_loader = lambda path, shuffle: VarlenDataLoader(
+        path, args.device_batch_size, MAX_SEQ_LEN, device=device,
+        shuffle=shuffle, varlen=args.varlen,
+    )
+    _val_path = args.input_val_bin if args.input_val_bin else default_val_path
+    build_val_loader = lambda: build_loader(_val_path, False)
+    eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+    _val_probe = build_val_loader()
+    eval_steps = min(eval_steps, _val_probe.num_steps)
+    del _val_probe
+
+    # Strided eval setup
+    do_strided = args.stride > 0
+    # Optimizer
+    optimizer = model.setup_optimizer()
+
+    # Warmup torch.compile for each cu_seqlens bucket size (avoids recompiles during training)
+    if args.varlen:
+        total_tokens = args.device_batch_size * MAX_SEQ_LEN
+        warmup_cu_buckets = tuple(VARLEN_CU_BUCKET_SIZE * i for i in range(1, 5))
+        warmup_iters = 3
+        warmup_x = torch.zeros(1, total_tokens, dtype=torch.long, device=device)
+        warmup_y = torch.zeros(1, total_tokens, dtype=torch.long, device=device)
+        print0(f"Warming up varlen compile buckets: {warmup_cu_buckets} ({warmup_iters} iters each)")
+        model.train()
+        for i, bucket_len in enumerate(warmup_cu_buckets):
+            print0(f"\tBucket {i+1}/{len(warmup_cu_buckets)}: {bucket_len} toks")
+            boundaries = list(range(0, total_tokens, MAX_SEQ_LEN))
+            if boundaries[-1] != total_tokens:
+                boundaries.append(total_tokens)
+            cu = torch.full((bucket_len,), total_tokens, dtype=torch.int32, device=device)
+            cu[:len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
+            for _ in range(warmup_iters):
+                with autocast_ctx:
+                    wloss = model(warmup_x, warmup_y, cu_seqlens=cu, max_seqlen=MAX_SEQ_LEN)
+                wloss.backward()
+                optimizer.zero_grad(set_to_none=True)
+        del warmup_x, warmup_y, wloss
+        torch.cuda.empty_cache()
+        print0("Varlen compile warmup done")
+
+    # Dataloaders
+    _train_path = args.input_bin if args.input_bin else default_train_path
+    train_loader = build_loader(_train_path, True)
+    TOKENS_PER_EPOCH = train_loader.total_tokens
+    x, y, cu_seqlens, max_seqlen, current_epoch = next(train_loader)
+
+    # Training config
+    tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
+    assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+    num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)
+    wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_iterations)
+    wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iterations)
+    print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
+    print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
+    print0(f"Eval set: {EVAL_TOKENS:,} tokens")
+
+    # Schedulers
+    def get_lr_multiplier(it):
+        warmup = round(WARMUP_RATIO * num_iterations)
+        warmdown = round(WARMDOWN_RATIO * num_iterations)
+        if it < warmup: return (it + 1) / warmup
+        elif it <= num_iterations - warmdown: return 1.0
+        else:
+            progress = (num_iterations - it) / warmdown
+            return progress + (1 - progress) * FINAL_LR_FRAC
+
+    def get_muon_momentum(it):
+        return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
+
+    # Training loop
+    step = 0
+    min_val_bpb = float("inf")
+    min_val_loss = float("inf")
+    epochs_without_improvement = 0
+    smooth_train_loss = 0
+    total_training_time = 0
+    recent_dts = []
+    steps_per_epoch = num_iterations / args.num_epochs
+    param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
+    ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
+
+    wall_clock_start = time.time()
+    _swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+    late_ckpt_paths = []
+
+    # Initial val evaluation
     model.eval()
     val_loader = build_val_loader()
     with autocast_ctx:
-        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
-    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
-    if avg_loss < min_val_loss:
-        min_val_loss, min_val_bpb = avg_loss, avg_bpb
+        val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes, varlen=args.varlen)
+    print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+    wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+    min_val_bpb = val_bpb
+    min_val_loss = val_loss
+    model.train()
 
-# Summary
-wall_clock_time = time.time() - wall_clock_start
-print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
-print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
-print0(f"Total training time: {total_training_time/60:.2f}m")
-final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
-print0(f"Final train loss: {final_train_loss:.6f}")
-print0(f"Min val BPB: {min_val_bpb:.6f}")
-print0(f"Min val Loss: {min_val_loss:.6f}")
-wandb_run.summary["final_train_loss"] = final_train_loss
-wandb_run.summary["best_val_loss"] = min_val_loss
+    while current_epoch <= args.num_epochs:
+        # Training step
+        synchronize()
+        t0 = time.time()
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                if args.varlen:
+                    loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                else:
+                    loss = model(x, y)
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+            x, y, cu_seqlens, max_seqlen, epoch = next(train_loader)
 
-if args.save_result and master_process:
-    result = {
-        "matrix_lr": args.matrix_lr,
-        "weight_decay": args.weight_decay,
-        "num_epochs": args.num_epochs,
-        "val_loss": val_loss,
-        "best_val_loss": min_val_loss,
-        "wandb_url": getattr(wandb_run, "url", None),
-    }
-    with open(args.save_result, "w") as f:
-        json.dump(result, f, indent=2)
-    print0(f"Result saved to {args.save_result}")
+        # Update optimizer
+        lrm = get_lr_multiplier(step)
+        # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
+        if _swa_start_step >= 0 and step >= _swa_start_step:
+            cycle_pos = (step - _swa_start_step) % steps_per_epoch
+            swa_base = max(lrm, 0.05)
+            lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
+        # WD schedule:
+        #   [0, wd_phase1_end_step]:              hold at weight_decay
+        #   [wd_phase1_end_step, wd_phase2_end_step]: decay to wd_mid
+        #   [wd_phase2_end_step, num_iterations]:     ramp up to wd_end
+        wd = np.interp(step,
+            [0, wd_phase1_end_step, wd_phase2_end_step, num_iterations],
+            [args.weight_decay, args.weight_decay, args.wd_mid, args.wd_end])
+        # Convert to a scale factor;
+        # groups with weight_decay=0.0 (scalar params) correctly stay at zero.
+        wd_scale = wd / args.weight_decay if args.weight_decay > 0 else 0.0
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if "initial_wd" not in group:
+                group["initial_wd"] = group.get("weight_decay", 0.0)
+            group["weight_decay"] = group["initial_wd"] * wd_scale
+            if group['kind'] == 'muon':
+                group["momentum"] = get_muon_momentum(step)
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        if ema_params is not None and step % args.update_ema_every == 0:
+            torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
+        train_loss_f = train_loss.item()
+        synchronize()
+        dt = time.time() - t0
 
-total_wall_time = time.time() - _script_start
-print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
+        step += 1
 
-wandb_run.finish()
-if dist.is_initialized():
-    dist.destroy_process_group()
+        # Logging
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased = smooth_train_loss / (1 - ema_beta**step)
+        pct = 100 * step / num_iterations
+        tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+        mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
+        if step > 3:
+            total_training_time += dt
+            recent_dts.append(dt)
+            if len(recent_dts) > 10:
+                recent_dts.pop(0)
+        eta_str = f" | eta: {(num_iterations - step) * sum(recent_dts) / len(recent_dts) / 60:.1f}m" if recent_dts else ""
+        print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+        wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+
+        # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
+        if ddp:
+            epoch_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
+            dist.all_reduce(epoch_tensor, op=dist.ReduceOp.MAX)
+            epoch = epoch_tensor.item()
+
+        # Epoch boundary: evaluate when the dataloader advances to a new epoch
+        if epoch != current_epoch:
+            model.eval()
+            val_loader = build_val_loader()
+            with autocast_ctx:
+                val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes, varlen=args.varlen)
+            print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+            wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+            # Save checkpoint for weight averaging
+            ckpt_path = os.path.join(checkpoints_dir, f"epoch_{current_epoch:03d}.pt")
+            if master_process:
+                os.makedirs(checkpoints_dir, exist_ok=True)
+                torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, ckpt_path)
+            late_ckpt_paths.append(ckpt_path)
+            if len(late_ckpt_paths) > args.swa_last_epochs:
+                old = late_ckpt_paths.pop(0)
+                if master_process and os.path.exists(old): os.remove(old)
+            # Early stopping
+            if val_bpb < min_val_bpb:
+                min_val_bpb = val_bpb
+                min_val_loss = val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if args.patience >= 0 and epochs_without_improvement >= args.patience:
+                    print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
+                    break
+
+            model.train()
+            current_epoch = epoch
+
+        # GC management
+        if step == 1:
+            gc.collect(); gc.freeze(); gc.disable()
+
+    # Final EMA evaluation
+    if ema_params is not None:
+        ema_updates = step // args.update_ema_every
+        if ema_updates > 0:
+            correction = 1.0 / (1.0 - param_ema_beta ** ema_updates)
+            model.eval()
+            with torch.no_grad():
+                for p, ema in zip(model.parameters(), ema_params):
+                    p.copy_(ema * correction)
+            val_loader = build_val_loader()
+            with autocast_ctx:
+                ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes, varlen=args.varlen)
+            print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
+            wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
+            val_bpb = ema_bpb
+            val_loss = ema_loss
+            if ema_bpb < min_val_bpb:
+                min_val_bpb = ema_bpb
+                min_val_loss = ema_loss
+
+    # Checkpoint weight averaging (recency-weighted)
+    if len(late_ckpt_paths) >= 2:
+        if ddp: dist.barrier()
+        n = len(late_ckpt_paths)
+        raw_w = list(range(1, n + 1))
+        weights = [w / sum(raw_w) for w in raw_w]
+        if master_process:
+            ckpts = [torch.load(p, map_location="cpu", weights_only=True) for p in late_ckpt_paths]
+            merged = {name: sum(w * ckpts[i][name].float() for i, w in enumerate(weights)) for name in ckpts[0]}
+            with torch.no_grad():
+                for name, p in orig_model.named_parameters():
+                    if name in merged: p.copy_(merged[name].to(p.device, p.dtype))
+        if ddp:
+            dist.barrier()
+            for p in orig_model.parameters(): dist.broadcast(p.data, src=0)
+        model.eval()
+        val_loader = build_val_loader()
+        with autocast_ctx:
+            avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes, varlen=args.varlen)
+        print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
+        wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
+        if avg_loss < min_val_loss:
+            min_val_loss, min_val_bpb = avg_loss, avg_bpb
+
+    # Strided eval at end of training
+    if do_strided:
+        model.eval()
+        with autocast_ctx:
+            s_bpb, s_loss = evaluate_bpb_strided(
+                model, default_val_path, token_bytes,
+                args.stride, MAX_SEQ_LEN, args.device_batch_size, device,
+                varlen=args.varlen)
+        print0(f"Strided (stride={args.stride}) | Val BPB: {s_bpb:.6f} | Val Loss: {s_loss:.6f}")
+        wandb_run.log({"strided/bpb": s_bpb, "strided/loss": s_loss})
+
+    # Summary
+    wall_clock_time = time.time() - wall_clock_start
+    print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
+    print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
+    print0(f"Total training time: {total_training_time/60:.2f}m")
+    final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
+    print0(f"Final train loss: {final_train_loss:.6f}")
+    print0(f"Min val BPB: {min_val_bpb:.6f}")
+    print0(f"Min val Loss: {min_val_loss:.6f}")
+    wandb_run.summary["final_train_loss"] = final_train_loss
+    wandb_run.summary["best_val_loss"] = min_val_loss
+
+    if master_process:
+        result = {
+            "matrix_lr": args.matrix_lr,
+            "weight_decay": args.weight_decay,
+            "num_epochs": args.num_epochs,
+            "val_loss": val_loss,
+            "best_val_loss": min_val_loss,
+            "wandb_url": getattr(wandb_run, "url", None),
+        }
+        with open(result_path, "w") as f:
+            json.dump(result, f, indent=2)
+        print0(f"Result saved to {result_path}")
+
+    # Save final model
+    if master_process:
+        print0(f"Saving model to {artifact_model_path}")
+        os.makedirs(os.path.dirname(artifact_model_path), exist_ok=True)
+        torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, artifact_model_path)
+        print0(f"Model saved to {artifact_model_path}")
+
+    print0(f"Min val BPB: {min_val_bpb:.6f} | Min val Loss: {min_val_loss:.6f}")
+    total_wall_time = time.time() - _script_start
+    print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
+
+    wandb_run.finish()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    if artifacts_log_f is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.stdout = stdout_orig
+        sys.stderr = stderr_orig
+        artifacts_log_f.close()
