@@ -98,6 +98,7 @@ The two hour track caps runs at a single 8xH100 node for at most two hours.
 8 | 3.081 | Ensemble of 12 models, distill alpha 0.5 | 03/18/26 | 42h 35m (1 node, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/7dc6c386ae6ccf8bc8fa9b03cc53acf7723c4084/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 9 | 3.045 | More looping, hyperparam tuning, model size increase | 03/19/26 | ~44h (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/fcfb67b230afcf2e1702936abc077defcf5f8657/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 10 | 3.024 | Use probability averaging over logit averaging, train 20 models | 03/31/26 | 210 hours (7xH100 node) | [Script](https://github.com/qlabs-eng/slowrun/blob/dceb3e9d5b6153058b8dadf36af84f6a7c622fdf/unlimited/train.py) | [@L-z-Chen](https://x.com/lzchen_ut)
+11 | 3.001 | Add MTP, IHA, MuonEq-R, adjust initialization, ensemble more models | 04/23/26 | 68 hours (4 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/eed13a509d79d55553b6e0c71d6f7e386c5b3c4c/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 
 
 
