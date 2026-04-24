@@ -70,6 +70,27 @@ def sha256_file(filepath):
     return h.hexdigest()
 
 
+EXPECTED_HASHES = {
+    "fineweb_val.pt": "6868ed375b289a89c72c2f9df1ecbdcff700c4b9478ca806435d2dbfad8573b1",
+    "fineweb_train.pt": "36e7c95c1e7f6ed952fb002d76a03044e8617fea7e696a68d7dc1ce78465dcaf",
+}
+
+
+def verify_hash(filepath):
+    """Check file hash against expected value and assert it matches."""
+    basename = os.path.basename(filepath)
+    actual = sha256_file(filepath)
+    expected = EXPECTED_HASHES.get(basename)
+    if expected is None:
+        print(f"  Hash for {basename}: {actual}")
+        print(f"  (no expected hash set — paste this value into EXPECTED_HASHES to lock it in)")
+    else:
+        assert actual == expected, (
+            f"HASH MISMATCH for {basename}!\n    expected: {expected}\n    actual:   {actual}"
+        )
+        print(f"  Hash OK for {basename}: {actual}")
+
+
 def preprocess(train_tokens, val_tokens, local_dir):
     encoder = tiktoken.get_encoding("gpt2")
     bos_id = encoder._special_tokens["<|endoftext|>"]
@@ -107,8 +128,8 @@ def preprocess(train_tokens, val_tokens, local_dir):
     write_datafile(train_path, train_tokens_arr, train_doc_starts, bos_id, TRAIN_SHUFFLE_SEED)
 
     print()
-    for p in (val_path, train_path):
-        print(f"  {os.path.basename(p)}: sha256={sha256_file(p)}")
+    verify_hash(val_path)
+    verify_hash(train_path)
 
     print(f"\nDone! Files saved to {local_dir}/")
 

@@ -27,6 +27,7 @@ import gc
 import math
 import time
 import json
+import numpy as np
 import argparse
 from types import SimpleNamespace
 from functools import partial
@@ -754,21 +755,18 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Pre-tokenized chunk dataloader with per-epoch shuffling."""
+    """Pre-tokenized dataloader with per-epoch shuffling."""
 
     def __init__(self, filepath, B, T, device="cuda", seed=42):
         data = torch.load(filepath, weights_only=True)
-        chunks = data['chunks']
-        valid_counts = data['valid_counts']
-        file_B = data['batch_size']
-        sequence_size = data['sequence_size']
-        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
+        all_tokens = data["tokens"].long()
+        sequence_size = T + 1
 
-        all_seqs = []
-        for chunk, vc in zip(chunks, valid_counts):
-            rows = chunk.view(file_B, sequence_size)[:vc]
-            all_seqs.append(rows)
-        all_seqs = torch.cat(all_seqs, dim=0).long()
+        # Reconstruct token-identical sequence ordering from og dataloader.
+        num_seqs = len(all_tokens) // sequence_size
+        all_seqs = all_tokens[:num_seqs * sequence_size].view(num_seqs, sequence_size)
+        perm = np.random.RandomState(data["seq_shuffle_seed"]).permutation(num_seqs)
+        all_seqs = all_seqs[torch.from_numpy(perm)]  # (N, T+1)
 
         _, rank, _, world_size = get_dist_info()
         seqs_per_step = B * world_size
@@ -825,17 +823,14 @@ class DDPValLoader:
     """
     def __init__(self, filepath, B, T, rank, world_size, device="cuda", seed=0):
         data = torch.load(filepath, weights_only=True)
-        chunks = data['chunks']
-        valid_counts = data['valid_counts']
-        file_B = data['batch_size']
-        sequence_size = data['sequence_size']
-        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
+        all_tokens = data["tokens"].long()
+        sequence_size = T + 1
 
-        all_seqs = []
-        for chunk, vc in zip(chunks, valid_counts):
-            rows = chunk.view(file_B, sequence_size)[:vc]
-            all_seqs.append(rows)
-        all_seqs = torch.cat(all_seqs, dim=0).long()
+        # Reconstruct the old sequence ordering from flat tokens
+        num_seqs = len(all_tokens) // sequence_size
+        all_seqs = all_tokens[:num_seqs * sequence_size].view(num_seqs, sequence_size)
+        perm = np.random.RandomState(data["seq_shuffle_seed"]).permutation(num_seqs)
+        all_seqs = all_seqs[torch.from_numpy(perm)]  # (N, T+1)
 
         seqs_per_step = B * world_size
         num_steps = len(all_seqs) // seqs_per_step

@@ -14,8 +14,6 @@ import time
 import json
 import sys
 import shutil
-import string
-import secrets
 import argparse
 from types import SimpleNamespace
 from functools import partial
@@ -173,7 +171,7 @@ class TeeStream:
 def resolve_run_dir(run_name):
     if run_name:
         return run_name, os.path.join(RUNS_DIR, run_name)
-    name = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    name = time.strftime('%Y%m%d_%H%M%S')
     return name, os.path.join(RUNS_DIR, name)
 
 # =============================================================================

@@ -15,9 +15,7 @@ import time
 import json
 import argparse
 import sys
-import secrets
 import shutil
-import string
 from types import SimpleNamespace
 from functools import partial
 from dataclasses import dataclass
@@ -155,8 +153,7 @@ def resolve_run_dir(run_name):
     if run_name:
         actual_run_name = run_name
     else:
-        alphabet = string.ascii_lowercase + string.digits
-        actual_run_name = "".join(secrets.choice(alphabet) for _ in range(6))
+        actual_run_name = time.strftime('%Y%m%d_%H%M%S')
     return actual_run_name, os.path.join(RUNS_DIR, actual_run_name)
 
 # =============================================================================
