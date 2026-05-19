@@ -18,7 +18,8 @@ For now the limited track lives in the root directory, the tiny track lives at [
 ## Running the current record 
 
 You can reproduce the limited-compute record by running the following commands: 
-```bash 
+```bash
+# Set HF_TOKEN and WANDB_API_KEY in your environment first
 git clone https://github.com/qlabs-eng/slowrun.git && cd slowrun
 pip install -r requirements.txt
 python prepare_data.py
