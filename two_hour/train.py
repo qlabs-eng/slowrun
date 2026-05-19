@@ -227,6 +227,7 @@ def load_state_dict_into_model(model, state_dict):
 # Flash Attention (FA3 on Hopper)
 # =============================================================================
 
+
 def _load_fa3():
     if not torch.cuda.is_available():
         return None
@@ -236,8 +237,12 @@ def _load_fa3():
             return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    except Exception:
+        return get_kernel('kernels-community/flash-attn3', version=1)
+    except ImportError:
+        print0("Warning: kernels package not found. Install with: pip install -U kernels")
+        return None
+    except Exception as e:
+        print0(f"Warning: Failed to load FA3 kernel: {e}")
         return None
 
 _fa3 = _load_fa3()
