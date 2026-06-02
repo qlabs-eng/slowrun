@@ -74,6 +74,10 @@ parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
+parser.add_argument("--max-train-steps", type=int, default=3040,
+                    help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
+parser.add_argument("--xsa-mode", choices=("off", "first6"), default="first6",
+                    help="Exclusive self-attention schedule.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -222,6 +226,8 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1
     device_batch_size: int = 32
+    xsa_mode: str = "first6"
+    xsa_eps: float = 1e-4
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -258,8 +264,9 @@ class CausalSelfAttention(nn.Module):
         pattern = config.window_pattern.upper()
         char = pattern[layer_idx % len(pattern)]
         self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
+        self.xsa_eps = config.xsa_eps
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -276,6 +283,14 @@ class CausalSelfAttention(nn.Module):
         if self.use_key_offset and T > 1:
             k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:].clone()
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if xsa_alpha is not None:
+            v_ref = v
+            if self.n_kv_head != self.n_head:
+                v_ref = v_ref.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+            alpha = torch.tanh(xsa_alpha).type_as(y).view(1, 1, self.n_head, 1)
+            v_hat = v_ref / v_ref.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(self.xsa_eps)
+            xsa_coeff = ((y * v_hat).sum(dim=-1, keepdim=True)) * alpha
+            y = torch.addcmul(y, v_hat, xsa_coeff, value=-1.0)
         # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -300,8 +315,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, xsa_alpha=xsa_alpha)
         x = x + self.mlp(norm(x))
         return x
 
@@ -327,6 +342,7 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
+        self.xsa_alphas = nn.Parameter(torch.zeros(config.n_layer, config.n_head))
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -348,6 +364,7 @@ class GPT(nn.Module):
 
         self.resid_lambdas.fill_(1.1)
         self.x0_lambdas.fill_(0.1)
+        self.xsa_alphas.zero_()
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
@@ -383,6 +400,13 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def _xsa_enabled(self, layer_idx):
+        if self.config.xsa_mode == "off":
+            return False
+        if self.config.xsa_mode == "first6":
+            return layer_idx < min(6, self.config.n_layer)
+        raise ValueError(f"unknown xsa_mode: {self.config.xsa_mode}")
         
     def _avg_causal_attended_keys(self, window, seq_len):
         if window < 0 or window >= seq_len - 1:
@@ -396,7 +420,8 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel()
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
-                          + self.skip_weights.numel())
+                          + self.skip_weights.numel()
+                          + self.xsa_alphas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
         attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
@@ -414,6 +439,7 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
+        xsa_params = [self.xsa_alphas] if self.config.xsa_mode != "off" else []
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
@@ -423,6 +449,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
+        if xsa_params:
+            param_groups.append(dict(kind='adamw', params=xsa_params, lr=SCALAR_LR,
+                                     betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -445,7 +474,8 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * skip
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha)
             if i < self.encoder_layers:
                 skip_connections.append(x)
         x = norm(x)
@@ -828,6 +858,7 @@ print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_l
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"  doc_shuffle={not args.no_doc_shuffle}")
+print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -847,7 +878,8 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
+                   xsa_mode=args.xsa_mode)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -882,11 +914,14 @@ tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
+target_iterations = args.max_train_steps if args.max_train_steps > 0 else num_iterations
 # Convert epoch boundaries to steps (must happen after num_iterations is known)
 wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_iterations)
 wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iterations)
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
+if args.max_train_steps > 0:
+    print0(f"Stopping after max_train_steps={args.max_train_steps:,}")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
 # Schedulers
@@ -978,13 +1013,13 @@ while current_epoch <= args.num_epochs:
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
-    pct = 100 * step / num_iterations
+    pct = 100 * step / target_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
     if step > 3:
         total_training_time += dt
     steps_done = step - 3
-    eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
+    eta_str = f" | eta: {(target_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
 
@@ -1023,6 +1058,10 @@ while current_epoch <= args.num_epochs:
 
         model.train()
         current_epoch = epoch
+
+    if args.max_train_steps > 0 and step >= args.max_train_steps:
+        print0(f"Reached max_train_steps={args.max_train_steps}")
+        break
 
     # GC management
     if step == 1:
@@ -1089,6 +1128,10 @@ if master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "max_train_steps": args.max_train_steps,
+        "xsa_mode": args.xsa_mode,
+        "effective_train_tokens": step * TOTAL_BATCH_SIZE,
+        "steps": step,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
