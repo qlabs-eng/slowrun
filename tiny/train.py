@@ -31,6 +31,415 @@ import numpy as np
 
 import tiktoken
 
+# Bind this rank to its GPU *before* the fused CE kernel below is compiled: that code
+# compiles the fused CE CUDA kernel at import time, and torch.cuda._compile_kernel binds the
+# resulting function to whatever CUDA context is current. Without this, every rank
+# compiles against cuda:0, and non-zero ranks later hit "CUDA error: invalid resource
+# handle" when launching the kernel on their own device.
+if "LOCAL_RANK" in os.environ:
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+# =============================================================================
+# Fused fp8 softcapped cross-entropy with multi-token prediction.
+# its backward. CE_KERNEL_VOCAB_SIZE is fixed at 50304 = the model's padded vocab.
+# =============================================================================
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _transpose_copy_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Coalesced read from src (M, N)
+    tile = tl.load(
+        src_ptr + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
+        mask=mask, other=0.0,
+    )
+
+    # Coalesced write to dst (N, M): dst[n, m] = src[m, n]
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    tl.store(
+        dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1,
+        tl.trans(tile), mask=mask_T,
+    )
+
+
+def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
+    """Tiled transpose copy: dst = src.T where src is (M, N) and dst is (N, M).
+
+    Uses a 64x128 tiled Triton kernel with coalesced reads AND writes,
+    achieving near memory-bandwidth-limited performance.
+    """
+    assert src.ndim == 2 and dst.ndim == 2
+    M, N = src.shape
+    assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
+
+    BLOCK_M, BLOCK_N = 64, 128
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _transpose_copy_kernel[grid](
+        src, dst,
+        M, N,
+        src.stride(0), src.stride(1),
+        dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+        num_stages=2,
+    )
+
+
+CE_KERNEL_BLOCK_SIZE = 256
+CE_KERNEL_VOCAB_SIZE = 50304
+
+CE_KERNEL_DECLS = f"""
+constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};
+constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
+"""
+
+CE_KERNEL_SOURCE = """
+#include <cuda_bf16.h>
+#include <math_constants.h>
+
+#define __nv_fp8_e5m2 char
+#define uint16_t unsigned short
+#define uint8_t unsigned char
+#define int64_t long long
+
+__device__ __forceinline__ __nv_fp8_e5m2 f32_to_fp8_e5m2(float x) {
+    uint16_t packed;
+    asm volatile(
+        "cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;"
+        : "=h"(packed)
+        : "f"(x), "f"(0.0f)
+    );
+    __nv_fp8_e5m2 result;
+    *reinterpret_cast<uint8_t*>(&result) = (packed & (0xFF << 8)) >> 8;
+    return result;
+}
+
+struct __align__(16) __nv_bfloat168 {
+    __nv_bfloat16 data[8];
+    __device__ __nv_bfloat16& operator[](int i) { return data[i]; }
+    __device__ const __nv_bfloat16& operator[](int i) const { return data[i]; }
+};
+
+struct __align__(8) __nv_fp8_e5m28 {
+    __nv_fp8_e5m2 data[8];
+    __device__ __nv_fp8_e5m2& operator[](int i) { return data[i]; }
+    __device__ const __nv_fp8_e5m2& operator[](int i) const { return data[i]; }
+};
+
+template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
+
+
+extern "C"
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void ce_fwd_bwd_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    const int64_t* __restrict__ targets,
+    const float* __restrict__ mtp_weights,
+    float* __restrict__ losses,
+    __nv_fp8_e5m2* grad_input,
+    int batch_size,
+    int n_predict,
+    double cap_param,
+    double grad_s_param,
+    double grad_scale_param)
+{
+  constexpr int VEC_WIDTH = 8;
+  constexpr int NUM_FULL_LOADS = VOCAB_SIZE / (BLOCK_SIZE * VEC_WIDTH);
+  constexpr int NUM_LOADS = CEIL_DIV(VOCAB_SIZE, BLOCK_SIZE * VEC_WIDTH);
+
+  float cap = (float)cap_param;
+  float grad_s = (float)grad_s_param;
+  float grad_scale = (float)grad_scale_param;
+
+  extern __shared__ __nv_bfloat16 smem[];
+
+  static_assert(VEC_WIDTH == 8);
+
+  const __nv_bfloat16 *block_logit_ptr = logits + VOCAB_SIZE * blockIdx.x;
+
+  float thread_max = -CUDART_INF_F;
+
+  #pragma unroll 25
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 result = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
+      __nv_bfloat168 result_t;
+      #pragma unroll
+      for (int k = 0; k < VEC_WIDTH; k++) {
+        float tmp = __bfloat162float(result[k]);
+        tmp = tanhf(tmp / cap);
+        result_t[k] = __float2bfloat16(tmp);
+        tmp = cap * tmp;
+        thread_max = max(tmp, thread_max);
+      }
+      *(__nv_bfloat168*)(&smem[idx]) = result_t;
+    }
+  }
+
+  constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+  int warp_id = threadIdx.x / 32;
+  __shared__ float block_maxs[NUM_WARPS];
+  __shared__ float block_sums[NUM_WARPS];
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
+
+  if (threadIdx.x % 32 == 0) {
+    block_maxs[warp_id] = thread_max;
+  }
+
+  __syncthreads();
+
+  float block_max = -CUDART_INF_F;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_max = fmaxf(block_max, block_maxs[i]);
+  }
+
+  float thread_sum = 0.0f;
+  #pragma unroll 2
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_bfloat168 l;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      l = *(__nv_bfloat168*)(&smem[idx]);
+    }
+    #pragma unroll
+    for (int k = 0; k < VEC_WIDTH; k++) {
+      float tmp = cap * __bfloat162float(l[k]);
+      tmp = __expf(tmp - block_max);
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+        thread_sum += tmp;
+      }
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+
+  if (threadIdx.x % 32 == 0) {
+    block_sums[warp_id] = thread_sum;
+  }
+
+  __syncthreads();
+
+  float block_sum = 0.0f;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_sum += block_sums[i];
+  }
+
+  float lse = block_max + __logf(block_sum);
+
+  if (threadIdx.x == 0) {
+    float total_loss = 0.0f;
+    for (int k = 0; k < n_predict; k++) {
+      int64_t target_idx = blockIdx.x + k;
+      if (target_idx < batch_size) {
+        float weight = mtp_weights[k];
+        int64_t target = targets[target_idx];
+        if (target >= 0 && target < VOCAB_SIZE) {
+          float z_target = cap * __bfloat162float(smem[target]);
+          total_loss += weight * (lse - z_target);
+        }
+      }
+    }
+    losses[blockIdx.x] = total_loss;
+  }
+
+  float S_w = 0.0f;
+
+  for (int i = 0; i < n_predict; i++) {
+    S_w += mtp_weights[i];
+  }
+
+  #pragma unroll 4
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_fp8_e5m28 result;
+
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 ts = *(__nv_bfloat168*)(&smem[idx]);
+      #pragma unroll
+      for (int j = 0; j < VEC_WIDTH; j++) {
+        float t = __bfloat162float(ts[j]);
+        float z = cap * t;
+        float p = __expf(z - lse);
+
+        float term1 = S_w * p;
+        float term2 = 0.0f;
+
+        float grad_z = term1 - term2;
+        float grad_x = grad_scale * (1.0f / grad_s) * grad_z * (1.0f - t * t);
+        auto result_tmp = f32_to_fp8_e5m2(grad_x);
+        result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+      }
+      *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
+    }
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x < n_predict && blockIdx.x + threadIdx.x < batch_size) {
+    int i = threadIdx.x;
+    int64_t target = targets[blockIdx.x + i];
+
+    float t = __bfloat162float(smem[target]);
+    float z = cap * t;
+    float p = __expf(z - lse);
+
+    float term1 = S_w * p;
+    float term2 = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+      int64_t target_idx = blockIdx.x + k;
+      if (target_idx < batch_size && k < n_predict) {
+        if (targets[target_idx] == target) {
+          term2 += mtp_weights[k];
+        }
+      }
+    }
+
+    float grad_z = term1 - term2;
+    float grad_x = grad_scale * (1.0f / grad_s) * grad_z * (1.0f - t * t);
+    auto result_tmp = f32_to_fp8_e5m2(grad_x);
+    auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+    grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
+  }
+}
+"""
+
+ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
+    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
+    "ce_fwd_bwd_kernel",
+    compute_capability="90",
+    cuda_include_dirs=["/usr/local/cuda/include/"],
+    nvcc_options=["-lineinfo", "--use_fast_math"],
+)
+ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+
+@torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
+def ce_fwd_bwd(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mtp_weights: torch.Tensor,
+    losses: torch.Tensor,
+    grad_input: torch.Tensor,
+    n_rows: int,
+    n_predict: int,
+    cap: float,
+    grad_s: float,
+    grad_scale: float,
+) -> None:
+    grid = (n_rows, 1, 1)
+    ce_fwd_bwd_kernel(
+        grid,
+        (CE_KERNEL_BLOCK_SIZE, 1, 1),
+        (logits, targets, mtp_weights, losses, grad_input,
+         n_rows, n_predict, cap, grad_s, grad_scale),
+        shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
+    )
+
+class FusedSoftcappedCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, cap=15.0):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
+        n_rows, n_cols = logits.shape
+        if mtp_weights is None:
+             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+        n_predict = mtp_weights.shape[0]
+
+        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+
+        logits = logits.contiguous()
+        targets = targets.contiguous()
+        mtp_weights = mtp_weights.contiguous()
+
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
+
+        ce_fwd_bwd(logits, targets, mtp_weights, losses, grad_input,
+             n_rows, n_predict, cap, grad_s, grad_scale)
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
+        ctx.params = (cap, x_s, w_s, grad_s)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input = ctx.saved_tensors
+        _, x_s, w_s, grad_s = ctx.params
+        n_rows, n_cols = logits.shape
+        n_predict = mtp_weights.shape[0]
+
+        grad_output = grad_output.contiguous()
+
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_input,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+        grad_x = grad_x * grad_output.unsqueeze(-1)
+
+        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+        transpose_copy(x_f8, x_f8_T)  # (H, n_rows) row-major
+
+        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+        transpose_copy(grad_input, grad_input_T)  # (V, n_rows) row-major
+
+        grad_w = torch._scaled_mm(
+            x_f8_T,            # (H, n_rows) row-major
+            grad_input_T.T,    # (n_rows, V) column-major view
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+        grad_w = grad_w * grad_output.mean()
+
+        return grad_x, None, None, grad_w, None, None, None, None, None
+
+
+
 _script_start = time.time()
 
 # =============================================================================
@@ -76,8 +485,12 @@ parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
 parser.add_argument("--max-train-steps", type=int, default=3040,
                     help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
-parser.add_argument("--xsa-mode", choices=("off", "first6"), default="first6",
+parser.add_argument("--xsa-mode", choices=("off", "first6","all"), default="all",
                     help="Exclusive self-attention schedule.")
+parser.add_argument("--mtp-predict", type=int, default=3,
+                    help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
+parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
+                    help="Fraction of training over which the extra MTP heads decay to zero weight.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -119,6 +532,16 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+
+# Multi-token prediction (MTP) ------------------------------------------------
+# fp8 scales for the fused softcapped cross-entropy kernel.
+MTP_X_S = 100 / 448
+MTP_W_S = 1.6 / 448
+MTP_GRAD_S = 0.75 / 448
+
+# Per-offset loss weights: predict targets[t], targets[t+1], ... with these weights.
+# Extra offsets anneal to zero over training so it ends as plain next-token prediction.
+MTP_START_WEIGHTS = [1.0, 0.5, 0.25, 0.125]
 
 # =============================================================================
 # Utilities
@@ -226,7 +649,7 @@ class GPTConfig:
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1
     device_batch_size: int = 32
-    xsa_mode: str = "first6"
+    xsa_mode: str = "all"
     xsa_eps: float = 1e-4
 
 def norm(x):
@@ -321,6 +744,17 @@ class Block(nn.Module):
         return x
 
 
+class CastedLinearT(nn.Module):
+    """Linear layer with weight stored as (in_features, out_features) — matches the layout
+    expected by FusedSoftcappedCrossEntropy without any transpose at call time."""
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(in_features, out_features, dtype=torch.bfloat16))
+
+    def forward(self, x):
+        return x @ self.weight.type_as(x)
+
+
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
@@ -333,7 +767,7 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        self.lm_head = CastedLinearT(config.n_embd, padded_vocab)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
@@ -406,6 +840,8 @@ class GPT(nn.Module):
             return False
         if self.config.xsa_mode == "first6":
             return layer_idx < min(6, self.config.n_layer)
+        if self.config.xsa_mode == "all":
+            return True
         raise ValueError(f"unknown xsa_mode: {self.config.xsa_mode}")
         
     def _avg_causal_attended_keys(self, window, seq_len):
@@ -462,7 +898,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', mtp_weights=None):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
@@ -479,11 +915,34 @@ class GPT(nn.Module):
             if i < self.encoder_layers:
                 skip_connections.append(x)
         x = norm(x)
+        if targets is not None:
+            # MTP training path: single lm_head, shifted targets, fused fp8 softcapped CE.
+            # Eval (mtp_weights=None / model.eval()) keeps the plain bf16 path below so
+            # validation loss/bpb stay on the true next-token objective.
+            if self.training and mtp_weights is not None:
+                return self._mtp_loss(x, targets, mtp_weights)
+            logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+            logits = 15 * torch.tanh(logits / 15)  # softcap
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
-        if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
         return logits
+
+    def _mtp_loss(self, x, targets, mtp_weights):
+        """Fused softcapped cross-entropy with multi-token prediction.
+
+        a SINGLE lm_head produces one set of logits per position,
+        scored against targets[t], targets[t+1], ... targets[t+k-1] with weights
+        `mtp_weights` (no separate prediction heads). The CUDA kernel computes the
+        logits internally via an fp8 matmul, so the lm_head weight is passed transposed
+        to (n_embd, vocab) -- the layout the kernel expects.
+        """
+        x_flat = x.reshape(-1, x.size(-1)).contiguous()
+        assert self.lm_head.weight.size(1) == CE_KERNEL_VOCAB_SIZE, (
+            f"lm_head vocab {self.lm_head.weight.size(1)} != fused kernel VOCAB_SIZE {CE_KERNEL_VOCAB_SIZE}")
+        return FusedSoftcappedCrossEntropy.apply(
+            x_flat, targets.reshape(-1), mtp_weights, self.lm_head.weight,
+            MTP_X_S, MTP_W_S, MTP_GRAD_S, 1.0)
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -500,6 +959,14 @@ polar_express_coeffs = [
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+    p.mul_(1 - lr_t * wd_t)
+    exp_avg.lerp_(grad, 1 - beta1_t)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    bias1 = 1 - beta1_t ** step_t
+    bias2 = 1 - beta2_t ** step_t
+    p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
+
+def adamw_step_eager(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
@@ -609,9 +1076,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
-                           self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                           self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            adamw_step = adamw_step_fused if group.get("compile_step", True) else adamw_step_eager
+            adamw_step(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
+                       self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                       self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
             if not pinfo['is_small']:
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
@@ -937,6 +1405,31 @@ def get_lr_multiplier(it):
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
+def get_mtp_weights(it):
+    """Per-offset MTP loss weights at optimizer step `it`.
+
+    Offset 0 (the real next token) is always weight 1.0. Extra offsets start at
+    MTP_START_WEIGHTS and decay linearly to zero over staggered sub-windows of
+    [0, mtp_anneal_frac]; the furthest-ahead offset dies first, so training ends as
+    plain next-token prediction. Length stays fixed (= mtp_predict) so the fused
+    kernel's grid and the compiled graph never need to change shape."""
+    n = max(1, min(args.mtp_predict, len(MTP_START_WEIGHTS)))
+    w = [1.0]
+    if n > 1:
+        f = min(1.0, it / max(1, num_iterations))
+        A = args.mtp_anneal_frac
+        for k in range(1, n):
+            seg_start = (n - 1 - k) / (n - 1) * A
+            seg_end = (n - k) / (n - 1) * A
+            if f <= seg_start:
+                frac = 1.0
+            elif f >= seg_end:
+                frac = 0.0
+            else:
+                frac = 1.0 - (f - seg_start) / (seg_end - seg_start)
+            w.append(MTP_START_WEIGHTS[k] * frac)
+    return torch.tensor(w, device=device, dtype=torch.float32)
+
 # Training loop
 step = 0
 min_val_bpb = float("inf")
@@ -968,9 +1461,14 @@ while current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
+    mtp_w = get_mtp_weights(step)  # same weights across the grad-accum micro-steps
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            # MTP path returns per-token weighted loss (B*T,); mean() reduces it as
+            # before. During the MTP phase this loss is the weighted multi-offset sum,
+            # so the logged value runs higher than the naive run until the extra
+            # offsets anneal to zero.
+            loss = model(x, y, mtp_weights=mtp_w).mean()
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
