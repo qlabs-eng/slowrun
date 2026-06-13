@@ -37,7 +37,7 @@ _script_start = time.time()
 
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=32)
-parser.add_argument("--num-epochs", type=int, default=24)
+parser.add_argument("--num-epochs", type=int, default=15)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run-name", type=str, default=None,
                     help="Run name under runs/ (default: random 6-char string)")
@@ -45,24 +45,24 @@ parser.add_argument("--scalar-lr", type=float, default=0.25)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
 parser.add_argument("--unembedding-lr", type=float, default=0.001)
-parser.add_argument("--weight-decay", type=float, default=0.2)
+parser.add_argument("--weight-decay", type=float, default=0.8)
 # WD follows a 3-phase schedule: hold → decay → ramp
 #   [0, wd-phase1-epoch]:          hold at --weight-decay
 #   [wd-phase1-epoch, wd-phase2-epoch]: decay to --wd-mid
 #   [wd-phase2-epoch, num-epochs]:      ramp up to --wd-end
 parser.add_argument("--wd-phase1-epoch", type=int, default=2)
 parser.add_argument("--wd-phase2-epoch", type=int, default=8)
-parser.add_argument("--wd-mid", type=float, default=0.02)
-parser.add_argument("--wd-end", type=float, default=0.3)
+parser.add_argument("--wd-mid", type=float, default=0.1)
+parser.add_argument("--wd-end", type=float, default=0.93)
 parser.add_argument("--warmup-ratio", type=float, default=0.0)
-parser.add_argument("--warmdown-ratio", type=float, default=0.6)
+parser.add_argument("--warmdown-ratio", type=float, default=0.4)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument(
     "--num-iterations",
     type=int,
-    default=3,
+    default=2,
     help="Maximum recurrent iterations through the network",
 )
 parser.add_argument(
@@ -75,7 +75,7 @@ parser.add_argument(
 parser.add_argument(
     "--min-iterations",
     type=int,
-    default=2,
+    default=1,
     help="Initial recurrent iterations for non-constant schedules",
 )
 parser.add_argument(
@@ -94,7 +94,7 @@ parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
-parser.add_argument("--dropout", type=float, default=0.05)
+parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
@@ -103,7 +103,7 @@ parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
 parser.add_argument("--max-train-steps", type=int, default=3040,
                     help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
-parser.add_argument("--xsa-mode", choices=("off", "first6"), default="first6",
+parser.add_argument("--xsa-mode", choices=("off", "first6"), default="off",
                     help="Exclusive self-attention schedule.")
 args = parser.parse_args()
 
