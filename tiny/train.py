@@ -3,6 +3,11 @@ Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
 Made for the Tiny Track of the NanoGPT Slowrun benchmark.
 
+This is the 2x-recurrence variant (recurrent latent-state model with a scheduled
+number of network passes), extended with two features from the tiny track:
+  * fp8 multi-token prediction (MTP) via the fused softcapped CE CUDA kernel, and
+  * full-layer exclusive self-attention (xsa_mode="all").
+
 Usage:
     torchrun --standalone --nproc_per_node=8 tiny/train.py
 """
@@ -17,7 +22,6 @@ import argparse
 import sys
 import shutil
 from types import SimpleNamespace
-from functools import partial
 from dataclasses import dataclass
 from contextlib import nullcontext
 
@@ -25,7 +29,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch import Tensor
 import wandb
 import numpy as np
 
@@ -51,7 +54,7 @@ _script_start = time.time()
 
 parser = argparse.ArgumentParser(description="Train GPT model")
 parser.add_argument("--device-batch-size", type=int, default=32)
-parser.add_argument("--num-epochs", type=int, default=16)
+parser.add_argument("--num-epochs", type=int, default=15)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run-name", type=str, default=None,
                     help="Run name under runs/ (default: random 6-char string)")
@@ -67,11 +70,40 @@ parser.add_argument("--weight-decay", type=float, default=0.8)
 parser.add_argument("--wd-phase1-epoch", type=int, default=2)
 parser.add_argument("--wd-phase2-epoch", type=int, default=8)
 parser.add_argument("--wd-mid", type=float, default=0.1)
-parser.add_argument("--wd-end", type=float, default=1.25)
-parser.add_argument("--warmdown-ratio", type=float, default=0.6)
+parser.add_argument("--wd-end", type=float, default=0.93)
+parser.add_argument("--warmup-ratio", type=float, default=0.0)
+parser.add_argument("--warmdown-ratio", type=float, default=0.4)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
+parser.add_argument(
+    "--num-iterations",
+    type=int,
+    default=2,
+    help="Maximum recurrent iterations through the network",
+)
+parser.add_argument(
+    "--iteration-schedule",
+    type=str,
+    default="late-transition",
+    choices=["constant", "late-transition"],
+    help="Schedule recurrent iterations over training",
+)
+parser.add_argument(
+    "--min-iterations",
+    type=int,
+    default=1,
+    help="Initial recurrent iterations for non-constant schedules",
+)
+parser.add_argument(
+    "--iteration-transition-ratio",
+    type=float,
+    default=0.3,
+    help=(
+        "Fraction of training spent at --num-iterations for late-transition "
+        "schedules; kept separate from LR warmdown"
+    ),
+)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
 parser.add_argument("--lr_multiplier", type=float, default=0.8)
@@ -88,7 +120,7 @@ parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
 parser.add_argument("--max-train-steps", type=int, default=3040,
                     help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
-parser.add_argument("--xsa-mode", choices=("off", "first6","all"), default="all",
+parser.add_argument("--xsa-mode", choices=("off", "first6", "all"), default="all",
                     help="Exclusive self-attention schedule.")
 parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
@@ -104,11 +136,22 @@ if args.output_json and not args.save_result:
 # Hyperparameters
 # =============================================================================
 
+# RLM
+NUM_ITERATIONS = args.num_iterations
+
 # Architecture
-DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
+if NUM_ITERATIONS < 1:
+    raise ValueError("--num-iterations must be >= 1")
+ITERATION_TRANSITION_RATIO = min(max(args.iteration_transition_ratio, 0.0), 1.0)
+if args.iteration_schedule != "constant":
+    if args.min_iterations < 1:
+        raise ValueError("--min-iterations must be >= 1")
+    if args.min_iterations > NUM_ITERATIONS:
+        raise ValueError("--min-iterations must be <= --num-iterations")
+DEPTH = args.n_layer
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -132,9 +175,12 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.0
+WARMUP_RATIO = args.warmup_ratio
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+TRAIN_BACKPROP_ITERATIONS = 1
+if TRAIN_BACKPROP_ITERATIONS < 1:
+    raise ValueError("TRAIN_BACKPROP_ITERATIONS must be >= 1")
 
 # Multi-token prediction (MTP) ------------------------------------------------
 # fp8 scales for the fused softcapped cross-entropy kernel.
@@ -158,6 +204,98 @@ def get_dist_info():
 def print0(s="", **kwargs):
     if int(os.environ.get('RANK', 0)) == 0:
         print(s, **kwargs)
+
+@dataclass(frozen=True)
+class IterationScheduleStage:
+    start_frac: float
+    end_frac: float
+    iterations: int
+
+
+@dataclass(frozen=True)
+class IterationSchedule:
+    stages: tuple
+    avg_iterations: float
+
+
+def build_iteration_schedule(
+    schedule_name,
+    min_iterations,
+    max_iterations,
+    n_layer,
+    transition_ratio,
+):
+    if max_iterations < 1:
+        raise ValueError("--num-iterations must be >= 1")
+    if n_layer <= 0:
+        raise ValueError("--n_layer must be > 0")
+
+    if schedule_name == "constant":
+        avg_iterations = float(max_iterations)
+        return IterationSchedule(
+            stages=(IterationScheduleStage(0.0, 1.0, max_iterations),),
+            avg_iterations=avg_iterations,
+        )
+
+    if min_iterations < 1:
+        raise ValueError("--min-iterations must be >= 1")
+    if min_iterations > max_iterations:
+        raise ValueError("--min-iterations must be <= --num-iterations")
+
+    transition_duration = min(max(transition_ratio, 0.0), 1.0)
+
+    if min_iterations == max_iterations or transition_duration >= 1.0 - 1e-9:
+        stages = (IterationScheduleStage(0.0, 1.0, max_iterations),)
+    elif transition_duration <= 1e-9:
+        stages = (IterationScheduleStage(0.0, 1.0, min_iterations),)
+    else:
+        transition_start = 1.0 - transition_duration
+        stages = (
+            IterationScheduleStage(0.0, transition_start, min_iterations),
+            IterationScheduleStage(transition_start, 1.0, max_iterations),
+        )
+    avg_iterations = sum(
+        (stage.end_frac - stage.start_frac) * stage.iterations
+        for stage in stages
+    )
+    return IterationSchedule(
+        stages=stages,
+        avg_iterations=avg_iterations,
+    )
+
+
+def get_scheduled_iterations(schedule, step, total_steps):
+    if total_steps <= 0:
+        return schedule.stages[-1].iterations
+    frac = min(max(step / total_steps, 0.0), 1.0)
+    for stage in schedule.stages:
+        if frac < stage.end_frac or stage is schedule.stages[-1]:
+            return stage.iterations
+    return schedule.stages[-1].iterations
+
+
+def format_iteration_schedule(schedule):
+    return ", ".join(
+        f"{stage.start_frac:.3f}-{stage.end_frac:.3f}: {stage.iterations}x"
+        for stage in schedule.stages
+    )
+
+
+def iteration_schedule_counts(schedule):
+    return tuple(dict.fromkeys(stage.iterations for stage in schedule.stages))
+
+
+def get_expected_scheduled_iterations(schedule, step, total_steps):
+    return float(get_scheduled_iterations(schedule, step, total_steps))
+
+
+ITERATION_SCHEDULE = build_iteration_schedule(
+    args.iteration_schedule,
+    args.min_iterations,
+    NUM_ITERATIONS,
+    DEPTH,
+    ITERATION_TRANSITION_RATIO,
+)
 
 class DummyWandb:
     def __init__(self): self.summary = {}
@@ -250,10 +388,11 @@ class GPTConfig:
     n_kv_head: int = N_HEAD
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
-    dropout: float = 0.1
+    dropout: float = 0.05
     device_batch_size: int = 32
     xsa_mode: str = "all"
     xsa_eps: float = 1e-4
+    num_iterations: int = NUM_ITERATIONS
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -446,25 +585,44 @@ class GPT(nn.Module):
         if self.config.xsa_mode == "all":
             return True
         raise ValueError(f"unknown xsa_mode: {self.config.xsa_mode}")
-        
+
     def _avg_causal_attended_keys(self, window, seq_len):
         if window < 0 or window >= seq_len - 1:
             return (seq_len + 1) / 2
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self):
+    def estimate_flops(self, num_iterations=None):
+        active_num_iterations = (
+            self.config.num_iterations if num_iterations is None else num_iterations
+        )
+        if not 1 <= active_num_iterations <= self.config.num_iterations + 2:
+            raise ValueError(
+                f"num_iterations must be in [1, {self.config.num_iterations + 2}], "
+                f"got {active_num_iterations}"
+            )
         nparams = sum(p.numel() for p in self.parameters())
+        shared_recurrent_params = (
+            sum(p.numel() for p in self.transformer.h.parameters())
+            + sum(p.numel() for p in self.ve_projs.parameters())
+        )
         # Exclude non-matmul params: embedding lookup + elementwise scalars
         nparams_exclude = (self.transformer.wte.weight.numel()
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
                           + self.skip_weights.numel()
                           + self.xsa_alphas.numel())
+        extra_nonshared_params = (
+            nparams - nparams_exclude - shared_recurrent_params
+        )
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        attn_flops = active_num_iterations * sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        effective_params = (
+            extra_nonshared_params
+            + active_num_iterations * shared_recurrent_params
+        )
+        return 6 * effective_params + attn_flops
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -472,7 +630,11 @@ class GPT(nn.Module):
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
         attn_gate_ids = {id(p) for p in attn_gate_params}
         all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
+        matrix_params = [
+            p
+            for p in all_h_params
+            if id(p) not in attn_gate_ids
+        ]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -501,35 +663,21 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean', mtp_weights=None):
-        B, T = idx.size()
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = norm(self.transformer.wte(idx))
-        x0 = x
+    def _run_network_once(self, x, x0, cos_sin):
         skip_connections = []
         for i, block in enumerate(self.transformer.h):
             if i >= self.encoder_layers and skip_connections:
                 skip = skip_connections.pop()
                 x = x + self.skip_weights[i - self.encoder_layers] * skip
+
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
             x = block(x, ve, cos_sin, self.window_sizes[i], xsa_alpha=xsa_alpha)
             if i < self.encoder_layers:
                 skip_connections.append(x)
-        x = norm(x)
-        if targets is not None:
-            # MTP training path: single lm_head, shifted targets, fused fp8 softcapped CE.
-            # Eval (mtp_weights=None / model.eval()) keeps the plain bf16 path below so
-            # validation loss/bpb stay on the true next-token objective.
-            if self.training and mtp_weights is not None:
-                return self._mtp_loss(x, targets, mtp_weights)
-            logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-            logits = 15 * torch.tanh(logits / 15)  # softcap
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)  # softcap
-        return logits
+
+        return x
 
     def _mtp_loss(self, x, targets, mtp_weights):
         """Fused softcapped cross-entropy with multi-token prediction.
@@ -546,6 +694,56 @@ class GPT(nn.Module):
         return FusedSoftcappedCrossEntropy.apply(
             x_flat, targets.reshape(-1), mtp_weights, self.lm_head.weight,
             MTP_X_S, MTP_W_S, MTP_GRAD_S, 1.0)
+
+    def forward(
+        self,
+        idx,
+        targets=None,
+        loss_reduction='mean',
+        num_iterations=None,
+        mtp_weights=None,
+    ):
+        B, T = idx.size()
+        active_num_iterations = (
+            self.config.num_iterations if num_iterations is None else num_iterations
+        )
+        if not 1 <= active_num_iterations <= self.config.num_iterations + 2:
+            raise ValueError(
+                f"num_iterations must be in [1, {self.config.num_iterations + 2}], "
+                f"got {active_num_iterations}"
+            )
+
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = norm(self.transformer.wte(idx))
+        x_emb = x  # original embedded input, used as the recurrent re-injection anchor
+        grad_start_iteration = 0
+        if self.training:
+            backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
+            grad_start_iteration = active_num_iterations - backprop_iterations
+        for iteration in range(active_num_iterations):
+            # Re-inject the original token embedding (not the drifting recurrent
+            # state) as the per-layer x0 anchor + value-embedding source each pass.
+            if self.training and iteration < grad_start_iteration:
+                with torch.no_grad():
+                    x = self._run_network_once(x, x_emb, cos_sin)
+                    x = norm(x)
+                x = x.detach()
+            else:
+                x = self._run_network_once(x, x_emb, cos_sin)
+                x = norm(x)
+        x = norm(x)
+        if targets is not None:
+            # MTP training path: single lm_head, shifted targets, fused fp8 softcapped CE.
+            # Eval (mtp_weights=None / model.eval()) keeps the plain bf16 path below so
+            # validation loss/bpb stay on the true next-token objective.
+            if self.training and mtp_weights is not None:
+                return self._mtp_loss(x, targets, mtp_weights)
+            logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+            logits = 15 * torch.tanh(logits / 15)  # softcap
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+        logits = 15 * torch.tanh(logits / 15)  # softcap
+        return logits
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -569,20 +767,14 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     bias2 = 1 - beta2_t ** step_t
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
-def adamw_step_eager(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
-
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+                    momentum_t, lr_t, wd_t, beta2_t, active_mask, ns_steps, red_dim):
     momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    active = active_mask.to(stacked_grads.dtype)
+    momentum_update = (1 - momentum) * active
+    momentum_buffer.mul_(1 - momentum_update).add_(stacked_grads * momentum_update)
+    g = stacked_grads.lerp(momentum_buffer, momentum) * active
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -601,7 +793,10 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_update = (1 - beta2) * active.to(second_momentum_buffer.dtype)
+    second_momentum_buffer.mul_(1 - second_momentum_update).add_(
+        v_mean.to(dtype=second_momentum_buffer.dtype) * second_momentum_update
+    )
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -611,7 +806,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    stacked_params.sub_((lr * g + lr * wd * stacked_params * mask) * active)
 
 
 class DistMuonAdamW(torch.optim.Optimizer):
@@ -633,7 +828,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
         infos = {}
         for p in group['params']:
             grad = p.grad
-            if p.numel() < 1024:
+            if grad is None:
+                continue
+            if p.numel() < 1024 or grad.shape[0] % world_size != 0:
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
@@ -651,16 +848,29 @@ class DistMuonAdamW(torch.optim.Optimizer):
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
         stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(torch.stack([p.grad for p in params]))
+        active_mask = torch.zeros(
+            (padded,) + (1,) * len(shape), dtype=torch.bool, device=device
+        )
+        for i, p in enumerate(params):
+            if p.grad is None:
+                stacked_grads[i].zero_()
+            else:
+                stacked_grads[i].copy_(p.grad)
+                active_mask[i].fill_(True)
         if len(params) < padded:
             stacked_grads[len(params):].zero_()
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(
+            future=future,
+            grad_chunk=grad_chunk,
+            stacked_grads=stacked_grads,
+            active_mask=active_mask,
+            chunk_size=chunk_size,
+        )
 
     def _compute_adamw(self, group, info, gather_list, rank, world_size):
-        for p in group['params']:
-            pinfo = info['param_infos'][p]
+        for p, pinfo in info['param_infos'].items():
             pinfo['future'].wait()
             state = self.state[p]
             if pinfo['is_small']:
@@ -679,10 +889,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step = adamw_step_fused if group.get("compile_step", True) else adamw_step_eager
-            adamw_step(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
-                       self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                       self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            adamw_step_fused(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
+                           self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                           self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
             if not pinfo['is_small']:
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
@@ -712,6 +921,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             muon_step_fused(info['grad_chunk'][:num_owned], owned,
                           state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                           self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                          info["active_mask"][start_idx:start_idx + num_owned],
                           group["ns_steps"], red_dim)
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
@@ -819,16 +1029,23 @@ class DataLoader:
 # =============================================================================
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb(
+    model,
+    batches,
+    steps,
+    token_bytes,
+    num_iterations=None,
+):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
+    model_kwargs = {"num_iterations": num_iterations}
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none').view(-1)
+        loss2d = model(x, y, loss_reduction='none', **model_kwargs).view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -846,6 +1063,44 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
     return bpb, loss
+
+
+def precompile_iteration_stages(model, x, y, mtp_weights, train_iteration_counts, eval_iteration_counts=None):
+    train_iteration_counts = tuple(dict.fromkeys(train_iteration_counts))
+    if eval_iteration_counts is None:
+        eval_iteration_counts = train_iteration_counts
+    else:
+        eval_iteration_counts = tuple(dict.fromkeys(eval_iteration_counts))
+    if not train_iteration_counts and not eval_iteration_counts:
+        return
+    print0(
+        "Precompiling recurrent iteration stages: "
+        f"train={train_iteration_counts}, eval={eval_iteration_counts}"
+    )
+    was_training = model.training
+    # Train precompile passes mirror the real training call: fused fp8 MTP path, so the
+    # warmed-up graph for each iteration count matches step 1 and avoids a recompile.
+    for count in train_iteration_counts:
+        print0(f"  precompile train {count}x", flush=True)
+        model.train()
+        model.zero_grad(set_to_none=True)
+        with autocast_ctx:
+            loss = model(x, y, num_iterations=count, mtp_weights=mtp_weights).mean()
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+
+    # Eval precompile passes stay MTP-free (plain bf16 next-token), matching real eval.
+    for count in eval_iteration_counts:
+        print0(f"  precompile eval {count}x", flush=True)
+        model.eval()
+        with torch.no_grad():
+            with autocast_ctx:
+                model(x, y, loss_reduction='none', num_iterations=count)
+        synchronize()
+    print0("  precompile done", flush=True)
+    model.train(was_training)
+    model.zero_grad(set_to_none=True)
+
 
 # =============================================================================
 # Training
@@ -925,11 +1180,24 @@ print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
-print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
+print0(f"  wd_schedule=hold {args.weight_decay} -> mid {args.wd_mid} -> end {args.wd_end}")
+print0(
+    f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, "
+    f"final_lr_frac={FINAL_LR_FRAC}"
+)
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
+print0(f"  max_num_iterations={NUM_ITERATIONS}")
+print0(f"  train_backprop_iterations={TRAIN_BACKPROP_ITERATIONS}")
+print0(
+    f"  iteration_schedule={args.iteration_schedule} "
+    f"({format_iteration_schedule(ITERATION_SCHEDULE)}), "
+    f"transition_ratio={ITERATION_TRANSITION_RATIO:.3f}, "
+    f"avg_layer_passes={DEPTH * ITERATION_SCHEDULE.avg_iterations:.3f}"
+)
 print0(f"  dropout={args.dropout}")
 print0(f"  doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
+print0(f"  mtp_predict={args.mtp_predict}, mtp_anneal_frac={args.mtp_anneal_frac}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -950,20 +1218,36 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
-                   xsa_mode=args.xsa_mode)
+                   xsa_mode=args.xsa_mode, num_iterations=NUM_ITERATIONS)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+
+# The fused fp8 MTP kernel has a compile-time-fixed vocab; the padded model vocab must match.
+assert model.lm_head.weight.size(1) == CE_KERNEL_VOCAB_SIZE, (
+    f"padded vocab {model.lm_head.weight.size(1)} != fused kernel VOCAB_SIZE {CE_KERNEL_VOCAB_SIZE}; "
+    "the MTP CUDA kernel requires these to match")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 other_params = param_counts - transformer_params - ve_params - lm_head_params
-num_flops_per_token = model.estimate_flops()
+max_flops_per_token = model.estimate_flops(NUM_ITERATIONS)
+scheduled_iteration_counts = iteration_schedule_counts(ITERATION_SCHEDULE)
+schedule_flops_per_token = {
+    iteration_count: model.estimate_flops(iteration_count)
+    for iteration_count in scheduled_iteration_counts
+}
+avg_flops_per_token = sum(
+    (stage.end_frac - stage.start_frac)
+    * schedule_flops_per_token[stage.iterations]
+    for stage in ITERATION_SCHEDULE.stages
+)
 print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
-print0(f"FLOPs per token: {num_flops_per_token:e}")
+print0(f"FLOPs per token at max iterations: {max_flops_per_token:e}")
+print0(f"Average scheduled FLOPs per token: {avg_flops_per_token:e}")
 
 # Compile
 orig_model = model
@@ -984,25 +1268,33 @@ x, y, current_epoch = next(train_loader)
 tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
-target_iterations = args.max_train_steps if args.max_train_steps > 0 else num_iterations
-# Convert epoch boundaries to steps (must happen after num_iterations is known)
-wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_iterations)
-wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iterations)
+num_train_steps = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
+target_iterations = args.max_train_steps if args.max_train_steps > 0 else num_train_steps
+steps_per_epoch = num_train_steps / args.num_epochs
+# Convert epoch boundaries to steps (must happen after num_train_steps is known)
+wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_train_steps)
+wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_train_steps)
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
-print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
+print0(f"Training for {args.num_epochs} epoch(s) (~{num_train_steps} steps estimated)")
 if args.max_train_steps > 0:
     print0(f"Stopping after max_train_steps={args.max_train_steps:,}")
+print0(f"Recurrent iteration schedule: {format_iteration_schedule(ITERATION_SCHEDULE)}")
+for stage in ITERATION_SCHEDULE.stages:
+    print0(
+        f"  {stage.start_frac:.3f}-{stage.end_frac:.3f} "
+        f"(~steps {round(stage.start_frac * num_train_steps)}-"
+        f"{round(stage.end_frac * num_train_steps)}): {stage.iterations} iteration(s)"
+    )
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
 
-# Schedulers
+
 def get_lr_multiplier(it):
-    warmup = round(WARMUP_RATIO * num_iterations)
-    warmdown = round(WARMDOWN_RATIO * num_iterations)
-    if it < warmup: return (it + 1) / warmup
-    elif it <= num_iterations - warmdown: return 1.0
+    warmup = round(WARMUP_RATIO * num_train_steps)
+    warmdown = round(WARMDOWN_RATIO * num_train_steps)
+    if warmup > 0 and it < warmup: return (it + 1) / warmup
+    elif warmdown <= 0 or it <= num_train_steps - warmdown: return 1.0
     else:
-        progress = (num_iterations - it) / warmdown
+        progress = (num_train_steps - it) / warmdown
         return progress + (1 - progress) * FINAL_LR_FRAC
 
 def get_muon_momentum(it):
@@ -1019,7 +1311,7 @@ def get_mtp_weights(it):
     n = max(1, min(args.mtp_predict, len(MTP_START_WEIGHTS)))
     w = [1.0]
     if n > 1:
-        f = min(1.0, it / max(1, num_iterations))
+        f = min(1.0, it / max(1, num_train_steps))
         A = args.mtp_anneal_frac
         for k in range(1, n):
             seg_start = (n - 1 - k) / (n - 1) * A
@@ -1041,26 +1333,77 @@ epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
-steps_per_epoch = num_iterations / args.num_epochs
 param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
 ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
 
 wall_clock_start = time.time()
-_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+_swa_start_step = (num_train_steps - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
 late_ckpt_paths = []
+def get_eval_iterations(active_iterations):
+    return active_iterations
+
+
+active_num_iterations = get_scheduled_iterations(
+    ITERATION_SCHEDULE, step, num_train_steps
+)
+active_expected_num_iterations = get_expected_scheduled_iterations(
+    ITERATION_SCHEDULE, step, num_train_steps
+)
+precompile_eval_iteration_counts = tuple(
+    dict.fromkeys(get_eval_iterations(count) for count in scheduled_iteration_counts)
+)
+precompile_iteration_stages(
+    model,
+    x,
+    y,
+    get_mtp_weights(step),
+    scheduled_iteration_counts,
+    precompile_eval_iteration_counts,
+)
 
 # Initial val evaluation
 model.eval()
 val_loader = build_val_loader()
+eval_num_iterations = get_eval_iterations(active_num_iterations)
 with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
-min_val_bpb = val_bpb
-min_val_loss = val_loss
+    val_bpb, val_loss = evaluate_bpb(
+        model, val_loader, eval_steps, token_bytes, num_iterations=eval_num_iterations
+    )
+print0(
+    f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} "
+    f"| eval iters: {eval_num_iterations} | train iters: {active_num_iterations}"
+)
+wandb_run.log({
+    "step": step,
+    "val/bpb": val_bpb,
+    "val/loss": val_loss,
+    "val/num_iterations": eval_num_iterations,
+    "val/train_num_iterations": active_num_iterations,
+    "val/train_expected_num_iterations": active_expected_num_iterations,
+    "val/train_expected_effective_layers": DEPTH * active_expected_num_iterations,
+    "val/train_actual_effective_layers": DEPTH * active_num_iterations,
+})
+if eval_num_iterations == NUM_ITERATIONS:
+    min_val_bpb = val_bpb
+    min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
+    next_num_iterations = get_scheduled_iterations(
+        ITERATION_SCHEDULE, step, num_train_steps
+    )
+    next_expected_num_iterations = get_expected_scheduled_iterations(
+        ITERATION_SCHEDULE, step, num_train_steps
+    )
+    if next_num_iterations != active_num_iterations:
+        active_num_iterations = next_num_iterations
+        active_expected_num_iterations = next_expected_num_iterations
+        print0(
+            f"\n=== Recurrent iterations -> {active_num_iterations} "
+            f"at step {step} ({100 * step / num_train_steps:.2f}%, "
+            f"epoch {current_epoch}) ==="
+        )
+
     # Training step
     synchronize()
     t0 = time.time()
@@ -1071,7 +1414,7 @@ while current_epoch <= args.num_epochs:
             # before. During the MTP phase this loss is the weighted multi-offset sum,
             # so the logged value runs higher than the naive run until the extra
             # offsets anneal to zero.
-            loss = model(x, y, mtp_weights=mtp_w).mean()
+            loss = model(x, y, num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -1086,9 +1429,9 @@ while current_epoch <= args.num_epochs:
     # WD schedule:
     #   [0, wd_phase1_end_step]:              hold at weight_decay
     #   [wd_phase1_end_step, wd_phase2_end_step]: decay to wd_mid
-    #   [wd_phase2_end_step, num_iterations]:     ramp up to wd_end
+    #   [wd_phase2_end_step, num_train_steps]:    ramp up to wd_end
     wd = np.interp(step,
-        [0, wd_phase1_end_step, wd_phase2_end_step, num_iterations],
+        [0, wd_phase1_end_step, wd_phase2_end_step, num_train_steps],
         [args.weight_decay, args.weight_decay, args.wd_mid, args.wd_end])
     # Convert to a scale factor;
     # groups with weight_decay=0.0 (scalar params) correctly stay at zero.
@@ -1116,13 +1459,22 @@ while current_epoch <= args.num_epochs:
     debiased = smooth_train_loss / (1 - ema_beta**step)
     pct = 100 * step / target_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
+    active_flops_per_token = schedule_flops_per_token[active_num_iterations]
+    mfu = 100 * active_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
     if step > 3:
         total_training_time += dt
     steps_done = step - 3
     eta_str = f" | eta: {(target_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    train_backprop_iterations = min(TRAIN_BACKPROP_ITERATIONS, active_num_iterations)
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | iters: {active_num_iterations}{eta_str}")
+    wandb_run.log({
+        "step": step,
+        "train/loss": debiased,
+        "train/lr_multiplier": lrm,
+        "train/mfu": mfu,
+        "train/num_iterations": active_num_iterations,
+        "train/backprop_iterations": train_backprop_iterations,
+    })
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1134,10 +1486,27 @@ while current_epoch <= args.num_epochs:
     if epoch != current_epoch:
         model.eval()
         val_loader = build_val_loader()
+        eval_num_iterations = get_eval_iterations(active_num_iterations)
         with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+            val_bpb, val_loss = evaluate_bpb(
+                model, val_loader, eval_steps, token_bytes, num_iterations=eval_num_iterations
+            )
+        print0(
+            f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} "
+            f"| Val Loss: {val_loss:.6f} | eval iters: {eval_num_iterations} "
+            f"| train iters: {active_num_iterations}"
+        )
+        wandb_run.log({
+            "step": step,
+            "epoch": current_epoch,
+            "val/bpb": val_bpb,
+            "val/loss": val_loss,
+            "val/num_iterations": eval_num_iterations,
+            "val/train_num_iterations": active_num_iterations,
+            "val/train_expected_num_iterations": active_expected_num_iterations,
+            "val/train_expected_effective_layers": DEPTH * active_expected_num_iterations,
+            "val/train_actual_effective_layers": DEPTH * active_num_iterations,
+        })
         # Save checkpoint for weight averaging
         ckpt_path = os.path.join(checkpoints_dir, f"epoch_{current_epoch:03d}.pt")
         if master_process:
@@ -1146,16 +1515,17 @@ while current_epoch <= args.num_epochs:
         if len(late_ckpt_paths) > args.swa_last_epochs:
             old = late_ckpt_paths.pop(0)
             if master_process and os.path.exists(old): os.remove(old)
-        # Early stopping
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-            min_val_loss = val_loss
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if args.patience >= 0 and epochs_without_improvement >= args.patience:
-                print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
-                break
+        # Early stopping / best-val tracking only compare max-iteration evals.
+        if eval_num_iterations == NUM_ITERATIONS:
+            if val_bpb < min_val_bpb:
+                min_val_bpb = val_bpb
+                min_val_loss = val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if args.patience >= 0 and epochs_without_improvement >= args.patience:
+                    print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
+                    break
 
         model.train()
         current_epoch = epoch
@@ -1179,16 +1549,27 @@ if ema_params is not None:
                 p.copy_(ema * correction)
         val_loader = build_val_loader()
         with autocast_ctx:
-            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
-        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
+            ema_bpb, ema_loss = evaluate_bpb(
+                model, val_loader, eval_steps, token_bytes, num_iterations=NUM_ITERATIONS
+            )
+        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f} | iters: {NUM_ITERATIONS}")
+        wandb_run.log({
+            "step": step,
+            "val/ema_bpb": ema_bpb,
+            "val/ema_loss": ema_loss,
+            "val/num_iterations": NUM_ITERATIONS,
+        })
         val_bpb = ema_bpb
         val_loss = ema_loss
         if ema_bpb < min_val_bpb:
             min_val_bpb = ema_bpb
             min_val_loss = ema_loss
 
-# Checkpoint weight averaging (recency-weighted)
+# Checkpoint weight averaging: average ALL saved late-epoch checkpoints, recency-weighted.
+# (Window sweep 2026-06-05 on the wd-end-1.0 config swept exclude-last {0,1,2} × window
+#  {2,3,4} × {recency,uniform}: averaging all swa_last_epochs ckpts recency-weighted beat
+#  excluding the final epoch by 0.0019 same-checkpoint — recency weighting already dilutes
+#  the final epoch's over-shrink, so no exclusion is needed. Bigger window > smaller.)
 if len(late_ckpt_paths) >= 2:
     if ddp: dist.barrier()
     n = len(late_ckpt_paths)
@@ -1196,7 +1577,7 @@ if len(late_ckpt_paths) >= 2:
     weights = [w / sum(raw_w) for w in raw_w]
     if master_process:
         ckpts = [torch.load(p, map_location="cpu", weights_only=True) for p in late_ckpt_paths]
-        merged = {name: sum(w * ckpts[i][name].float() for i, w in enumerate(weights)) for name in ckpts[0]}
+        merged = {name: sum(weights[i] * ckpts[i][name].float() for i in range(n)) for name in ckpts[0]}
         with torch.no_grad():
             for name, p in orig_model.named_parameters():
                 if name in merged: p.copy_(merged[name].to(p.device, p.dtype))
@@ -1204,11 +1585,10 @@ if len(late_ckpt_paths) >= 2:
         dist.barrier()
         for p in orig_model.parameters(): dist.broadcast(p.data, src=0)
     model.eval()
-    val_loader = build_val_loader()
     with autocast_ctx:
-        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
-    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
+        avg_bpb, avg_loss = evaluate_bpb(model, build_val_loader(), eval_steps, token_bytes, num_iterations=NUM_ITERATIONS)
+    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f} | iters: {NUM_ITERATIONS}")
+    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss, "ckpt_avg/num_iterations": NUM_ITERATIONS})
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
 
@@ -1228,11 +1608,21 @@ if master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
+        "wd_mid": args.wd_mid,
+        "wd_end": args.wd_end,
+        "dropout": args.dropout,
         "num_epochs": args.num_epochs,
         "max_train_steps": args.max_train_steps,
         "xsa_mode": args.xsa_mode,
+        "mtp_predict": args.mtp_predict,
+        "mtp_anneal_frac": args.mtp_anneal_frac,
         "effective_train_tokens": step * TOTAL_BATCH_SIZE,
         "steps": step,
+        "max_num_iterations": NUM_ITERATIONS,
+        "train_backprop_iterations": TRAIN_BACKPROP_ITERATIONS,
+        "iteration_schedule": args.iteration_schedule,
+        "iteration_transition_ratio": ITERATION_TRANSITION_RATIO,
+        "avg_effective_layers": DEPTH * ITERATION_SCHEDULE.avg_iterations,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
