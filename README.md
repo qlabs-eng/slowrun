@@ -75,6 +75,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 9 | 3.345 | Add [Stochastic Weight Averaging (SWA)](https://arxiv.org/pdf/1803.05407) | 04/01/26 | 14.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/e094217e7a1abffae5b3ee06737b6d1747d76a48/tiny/train.py) | [@shmublu](https://x.com/ShmuelBerman)
 10 | 3.332 | Add document-level shuffling | 04/24/26 | 14.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a4732774888d535f681295de4ef1c66a57a3cc60/tiny/train.py) | [@samacqua](https://x.com/Sam_Acqua)
 11 | 3.329 | Add learnable XSA | 06/07/26 | 14.7 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/bcf188f2912479ad76e17b6589d69bed882fe525/tiny/train.py) | [@LucaCerovaz](https://x.com/LucaCerovaz)
+12 | 3.324 | Add 2x recurrence | 06/07/26 | 14.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a2c443e18f99d0f6e35c6013c752e636fe402213/tiny/train.py) | [@neel04](https://x.com/awesome_ruler_)
 
 
 
