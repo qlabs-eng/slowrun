@@ -89,6 +89,8 @@ parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
 parser.add_argument("--window-schedule", type=str, default="1-6:256,768;7-13:768,1792;14-22:1280,2048",
                     help="Epoch-window schedule 'start-end:short,long;...'. Applies YaRN on long-window expansions.")
+parser.add_argument("--no-doc-shuffle", action="store_true",
+                    help="Disable per-epoch document reshuffling (still shuffles batch order)")
 args = parser.parse_args()
 args.window_schedule_spec = args.window_schedule.strip()
 
@@ -110,6 +112,7 @@ WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
 DATA_DIR = "fineweb_data"
+BOS_ID = 50256  # <|endoftext|>
 
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
@@ -880,49 +883,78 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Pre-tokenized dataloader. Yields (inputs, targets, epoch) forever."""
+    """Loads flat tokens , chunks into batches.
 
-    def __init__(self, filepath, B, T, device="cuda"):
+    doc_shuffle=False: applies the stored default sequence permutation (bitwise match
+    with the old chunked pipeline), shuffles batch order each epoch.
+    doc_shuffle=True: reshuffles documents each epoch, re-chunks, re-shuffles sequences.
+
+    Always yields (x, y, epoch).
+    """
+
+    def __init__(self, filepath, B, T, device="cuda", doc_shuffle=False):
         data = torch.load(filepath, weights_only=True)
         all_tokens = data["tokens"].long()
-        sequence_size = T + 1
+        raw_doc_starts = data["doc_starts"].long()
+        bos_id = int(data["bos_id"])
+        assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
 
-        # Reconstruct the old sequence ordering from flat tokens
-        num_seqs = len(all_tokens) // sequence_size
-        all_seqs = all_tokens[:num_seqs * sequence_size].view(num_seqs, sequence_size)
-        perm = np.random.RandomState(data["seq_shuffle_seed"]).permutation(num_seqs)
-        all_seqs = all_seqs[torch.from_numpy(perm)]  # (N, T+1)
+        doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
+        self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
+        self.default_shuffle_seed = data["seq_shuffle_seed"]
 
-        # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
-        seqs_per_step = B * world_size
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.B = B
+        self.T = T
+        self.seq_size = T + 1
+        self.doc_shuffle = doc_shuffle
+        self.epoch = 1
+        self._build_batches()
+
+    def _build_batches(self):
+        tokens = torch.cat(self.doc_tokens)
+        num_seqs = len(tokens) // self.seq_size
+        all_seqs = tokens[:num_seqs * self.seq_size].view(num_seqs, self.seq_size)
+        if self.doc_shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.epoch + 1000)
+            all_seqs = all_seqs[torch.randperm(num_seqs, generator=g)]
+        else:
+            perm = np.random.RandomState(self.default_shuffle_seed).permutation(num_seqs)
+            all_seqs = all_seqs[torch.from_numpy(perm)]
+        seqs_per_step = self.B * self.world_size
         num_steps = len(all_seqs) // seqs_per_step
         usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
-
-        self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
+        all_seqs = all_seqs[:usable].view(num_steps, self.world_size, self.B, self.seq_size)
+        self.rank_data = all_seqs[:, self.rank].contiguous()
         self.num_steps = num_steps
-        self.total_tokens = usable * T  # trainable tokens across all ranks
-        self.device = device
+        self.total_tokens = usable * self.T
         self.pos = 0
-        self.epoch = 1
 
     def __iter__(self):
         return self
 
-    def _shuffle(self):
-        """Shuffle batch order for the new epoch, consistent across ranks."""
-        g = torch.Generator()
-        g.manual_seed(self.epoch)
-        perm = torch.randperm(self.num_steps, generator=g)
-        self.rank_data = self.rank_data[perm]
+    def _next_epoch(self):
+        self.epoch += 1
+        print0(f"Starting epoch {self.epoch}")
+        if self.doc_shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            perm = torch.randperm(len(self.doc_tokens), generator=g)
+            self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
+            self._build_batches()
+        else:
+            self.pos = 0
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            self.rank_data = self.rank_data[torch.randperm(self.num_steps, generator=g)]
 
     def __next__(self):
         if self.pos >= self.num_steps:
-            self.pos = 0
-            self.epoch += 1
-            print0(f"Starting epoch {self.epoch}")
-            self._shuffle()
+            self._next_epoch()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
@@ -1085,7 +1117,7 @@ print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
-print0(f"  dropout={args.dropout}")
+print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
 if args.window_schedule:
     print0(f"  window_schedule={args.window_schedule_spec}")
 print0(f"-----------------------")
@@ -1140,7 +1172,7 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
