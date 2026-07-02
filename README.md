@@ -92,6 +92,7 @@ The two hour track caps runs at a single 8xH100 node for at most two hours.
 3 | 3.188 | Add [MuonEq-R](https://arxiv.org/abs/2603.28254) | 04/20/26 | 116.3 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/eec06c03996d1a568025624871540ba8cfe85274/two_hour/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
 4 | 3.150 | Add weight decay schedule, adjust learning rate schedule | 04/29/26 | 117.5 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/2ce395d576ea6755b19a83819f32930059cb2a84/two_hour/train.py) | [@shmublu](https://x.com/ShmuelBerman)
 5 | 3.144 | Add back context window scheduling | 05/04/26 | 117.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a51d5e0e90d53bc6c8988d24a7bc9971ffa710f3/two_hour/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
+6 | 3.139 | Add per-epoch document-level shuffling | 07/02/26 | 117.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/37a4173714365721ad9bdea695a903a84a193208/two_hour/train.py) | [@AjAnubolu](https://github.com/AjAnubolu)
 
 
 ### Unlimited Compute Track 
