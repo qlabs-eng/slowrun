@@ -140,6 +140,18 @@ Given the strong performance by large models that are well regularized, we specu
 
 We choose 100M tokens because it is small enough to affordably try radically different learning algorithms, while large enough that the winning techniques may work at a larger scale, though the scaling behavior is an open empirical question.
 
+## Citation
+
+```bibtex
+@misc{slowrun_2026,
+  author       = {Akshay Vegesna and Samip Dahal and Chinmay Karkar and
+                  Bishwas Mandal and Shmuel Berman and Zhiwei Xu},
+  title        = {Slowrun: Language modeling with infinite compute, fixed data},
+  year         = {2026},
+  url          = {https://github.com/qlabs-eng/slowrun}
+}
+```
+
 [^1]: For practical purposes, we begin by providing an upper bound on time of 64 H100's for 7 days. For reference, nanogpt can be trained for 1 epoch in 30s, so using this amount of compute would be 100,000x the compute used by that baseline.
 
 [^2]: Konwoo Kim, Suhas Kotha, Percy Liang, and Tatsunori Hashimoto. ["Pre-training under infinite compute."](https://arxiv.org/abs/2509.14786) arXiv:2509.14786, 2025.
