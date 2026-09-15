@@ -126,6 +126,12 @@ parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
 parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
                     help="Fraction of training over which the extra MTP heads decay to zero weight.")
+# --- every-step meta-gradient step (default for this entry; --mg-every 0 = entry 14) ---
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--mg-every", type=int, default=1, help="meta-gradient step every N steps (1 = every step, the record; 0 = off = entry 14)")
+parser.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
+parser.add_argument("--mg-step-schedule", type=str, default="const", choices=["const", "lr"])
+parser.add_argument("--mg-plastic", type=str, default="mlp_all", choices=["matrix_all", "mlp_all"])
 args = parser.parse_args()
 
 # Resolve output path
@@ -1109,12 +1115,12 @@ def precompile_iteration_stages(model, x, y, mtp_weights, train_iteration_counts
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 master_process = ddp_rank == 0
-torch.manual_seed(42)
+torch.manual_seed(args.seed)
 
 if ddp and torch.cuda.is_available():
     device = torch.device("cuda", ddp_local_rank)
     torch.cuda.set_device(device)
-    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed(args.seed)
     dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
 else:
@@ -1256,6 +1262,40 @@ model = torch.compile(model, dynamic=False)
 # Optimizer
 optimizer = model.setup_optimizer()
 
+# ---- every-step meta-gradient step ----
+MG = args.mg_every > 0
+mg_params, mg_owned = [], []   # plastic matrices; indices of the ones this rank owns in the Muon step
+if MG:
+    owned_ids = set()
+    for g in optimizer.param_groups:
+        if g.get("kind") == "muon":   # Muon updates params[rank*chunk:(rank+1)*chunk] on this rank and all-gathers the rest
+            chunk = (len(g["params"]) + ddp_world_size - 1) // ddp_world_size
+            owned_ids.update(id(p) for p in g["params"][ddp_rank * chunk:(ddp_rank + 1) * chunk])
+    muon_ids = {id(p) for g in optimizer.param_groups if g.get("kind") == "muon" for p in g["params"]}
+    for name, p in orig_model.named_parameters():
+        if id(p) in muon_ids and (args.mg_plastic == "matrix_all" or ".mlp." in name):
+            mg_params.append(p)
+            if id(p) in owned_ids:
+                mg_owned.append(len(mg_params) - 1)
+    print0(f"[mg] every {args.mg_every} steps, step norm {args.mg_step_norm} ({args.mg_step_schedule}), "
+           f"{len(mg_params)} plastic matrices, {sum(p.numel() for p in mg_params):,} parameters; "
+           f"rank {ddp_rank} restores {len(mg_owned)} of them")
+mg_owned_params = [mg_params[i] for i in mg_owned]
+
+@torch.no_grad()
+def mg_temporary_step(step):
+    """theta_P <- theta_P - eta * g_P / ||g_P|| with g the gradient of the first half-batch on this rank.
+    Returns (scaled gradient of the owned matrices, alpha) so the caller can undo the step: the Muon
+    step overwrites every matrix this rank does not own with the owner's all-gathered copy, so only
+    the owned matrices need restoring."""
+    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in mg_params]
+    norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).clamp_min(1e-12)
+    eta = args.mg_step_norm * (get_lr_multiplier(step) if args.mg_step_schedule == "lr" else 1.0)
+    alpha = -eta / float(norm)
+    kept = [grads[i].clone() for i in mg_owned]
+    torch._foreach_add_(mg_params, grads, alpha=alpha)
+    return kept, alpha
+
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
@@ -1360,6 +1400,11 @@ precompile_iteration_stages(
     scheduled_iteration_counts,
     precompile_eval_iteration_counts,
 )
+if MG:
+    # the step runs two half-batch passes per step; warm that shape for every recurrence stage
+    # too, otherwise the 1x->2x transition recompiles inside the timed region
+    _h = x.size(0) // 2
+    precompile_iteration_stages(model, x[:_h], y[:_h], get_mtp_weights(step), scheduled_iteration_counts, ())
 
 # Initial val evaluation
 model.eval()
@@ -1408,16 +1453,33 @@ while current_epoch <= args.num_epochs:
     synchronize()
     t0 = time.time()
     mtp_w = get_mtp_weights(step)  # same weights across the grad-accum micro-steps
-    for micro_step in range(grad_accum_steps):
+    if MG and step % args.mg_every == 0 and grad_accum_steps == 1:
+        # split pairing on the device batch: first half adapts, second half is evaluated at the
+        # adapted point; the optimizer receives the ordinary full-batch mean gradient
+        half = x.size(0) // 2
         with autocast_ctx:
-            # MTP path returns per-token weighted loss (B*T,); mean() reduces it as
-            # before. During the MTP phase this loss is the weighted multi-offset sum,
-            # so the logged value runs higher than the naive run until the extra
-            # offsets anneal to zero.
-            loss = model(x, y, num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
+            loss = model(x[:half], y[:half], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
+        (loss * 0.5).backward()
+        mg_kept, mg_alpha = mg_temporary_step(step)
+        with autocast_ctx:
+            loss_q = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
+        (loss_q * 0.5).backward()
+        with torch.no_grad():
+            torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
+        del mg_kept
+        train_loss = 0.5 * (loss.detach() + loss_q.detach())
         x, y, epoch = next(train_loader)
+    else:
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                # MTP path returns per-token weighted loss (B*T,); mean() reduces it as
+                # before. During the MTP phase this loss is the weighted multi-offset sum,
+                # so the logged value runs higher than the naive run until the extra
+                # offsets anneal to zero.
+                loss = model(x, y, num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+            x, y, epoch = next(train_loader)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
