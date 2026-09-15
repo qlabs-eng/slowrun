@@ -56,6 +56,7 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 18 | 3.211 | Add [MuonEq-R](https://arxiv.org/abs/2603.28254) | 04/17/26 | 59.4 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a2ed9f4530d2dbd80b8cc0b8775659b196053277/train.py) | [@clarkkev](https://github.com/clarkkev)
 19 | 3.204 | Add document-level shuffling | 04/24/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a4732774888d535f681295de4ef1c66a57a3cc60/train.py) | [@samacqua](https://x.com/Sam_Acqua)
 20 | 3.195 | Add weight decay schedule, adjust learning rate schedule | 04/26/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/571b296eda47bdd291937d017ea49f23317088cb/train.py) | [@shmublu](https://x.com/ShmuelBerman)
+21 | 3.183 | First-order meta-gradient every step on the MLP matrices | 09/05/26 | 59.3 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/45bf3fdf229c2079f276142073838b924a333ba1/train.py) | [@xingyudang](https://x.com/xingyudang)
 
 
 ### Tiny Track (15 minutes)
@@ -78,6 +79,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 12 | 3.324 | Add 2x recurrence | 06/07/26 | 14.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a2c443e18f99d0f6e35c6013c752e636fe402213/tiny/train.py) | [@neel04](https://x.com/awesome_ruler_)
 13 | 3.315 | Add fp8 MTP + full-layer XSA | 06/08/26 | 13.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/9732ac294aba594a1fbb3aff1bb93cfdf2ce6788/tiny/train.py) | [@Mister-dev-oss](https://github.com/Mister-dev-oss)
 14 | 3.307 | Merge 2x recurrence with latest changes | 06/14/26 | 14.1 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/d1fbdb76386347f1097ed051f4bebaef2c17758d/tiny/train.py) | [@neel04](https://x.com/awesome_ruler_)
+15 | 3.295 | First-order meta-gradient every step on the MLP matrices | 09/05/26 | 14.2 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/45bf3fdf229c2079f276142073838b924a333ba1/tiny/train.py) | [@xingyudang](https://x.com/xingyudang)
 
 
 
