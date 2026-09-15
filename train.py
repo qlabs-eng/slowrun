@@ -56,7 +56,7 @@ parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
-parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--dropout", type=float, default=0.05)   # 0.1 in entry 20
 parser.add_argument("--dupe-start-epoch", type=int, default=7,
                     help="Epoch to enable layer duplication")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
@@ -80,7 +80,7 @@ parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
 parser.add_argument("--swa-last-epochs", type=int, default=3,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
-parser.add_argument("--stoch-depth", type=float, default=0.05,
+parser.add_argument("--stoch-depth", type=float, default=0.0,   # 0.05 in entry 20
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--mtp-weight", type=float, default=0.3,
                     help="Multi-token prediction weight (0=off)")
@@ -92,6 +92,13 @@ parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
 parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
+# --- every-step meta-gradient step (default for this entry; --mg-every 0 --dropout 0.1 --stoch-depth 0.05 = entry 20) ---
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--mg-every", type=int, default=1, help="meta-gradient step every N steps (1 = every step, the record; 0 = off = entry 20)")
+parser.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
+parser.add_argument("--mg-step-schedule", type=str, default="lr", choices=["const", "lr"],
+                    help="lr: scale the step norm by the warmdown learning-rate multiplier")
+parser.add_argument("--mg-plastic", type=str, default="matrix_all", choices=["matrix_all", "mlp_all"])
 args = parser.parse_args()
 
 # Resolve output path
@@ -947,12 +954,12 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 master_process = ddp_rank == 0
-torch.manual_seed(42)
+torch.manual_seed(args.seed)
 
 if ddp and torch.cuda.is_available():
     device = torch.device("cuda", ddp_local_rank)
     torch.cuda.set_device(device)
-    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed(args.seed)
     dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
 else:
@@ -1062,6 +1069,40 @@ model = torch.compile(model, dynamic=False)
 # Optimizer
 optimizer = model.setup_optimizer()
 
+# ---- every-step meta-gradient step ----
+MG = args.mg_every > 0
+mg_params, mg_owned = [], []   # plastic matrices; indices of the ones this rank owns in the Muon step
+if MG:
+    owned_ids = set()
+    for g in optimizer.param_groups:
+        if g["kind"] == "muon":   # Muon updates params[rank*chunk:(rank+1)*chunk] on this rank and all-gathers the rest
+            chunk = (len(g["params"]) + ddp_world_size - 1) // ddp_world_size
+            owned_ids.update(id(p) for p in g["params"][ddp_rank * chunk:(ddp_rank + 1) * chunk])
+    muon_ids = {id(p) for g in optimizer.param_groups if g["kind"] == "muon" for p in g["params"]}
+    for name, p in orig_model.named_parameters():
+        if id(p) in muon_ids and (args.mg_plastic == "matrix_all" or ".mlp." in name):
+            mg_params.append(p)
+            if id(p) in owned_ids:
+                mg_owned.append(len(mg_params) - 1)
+    print0(f"[mg] every {args.mg_every} steps, step norm {args.mg_step_norm} ({args.mg_step_schedule}), "
+           f"{len(mg_params)} plastic matrices, {sum(p.numel() for p in mg_params):,} parameters; "
+           f"rank {ddp_rank} restores {len(mg_owned)} of them")
+mg_owned_params = [mg_params[i] for i in mg_owned]
+
+@torch.no_grad()
+def mg_temporary_step(step):
+    """theta_P <- theta_P - eta * g_P / ||g_P|| with g the gradient accumulated so far on this rank.
+    Returns (scaled gradient of the owned matrices, alpha) so the caller can undo the step: the Muon
+    step overwrites every matrix this rank does not own with the owner's all-gathered copy, so only
+    the owned matrices need restoring."""
+    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in mg_params]
+    norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).clamp_min(1e-12)
+    eta = args.mg_step_norm * (get_lr_multiplier(step) if args.mg_step_schedule == "lr" else 1.0)
+    alpha = -eta / float(norm)
+    kept = [grads[i].clone() for i in mg_owned]
+    torch._foreach_add_(mg_params, grads, alpha=alpha)
+    return kept, alpha
+
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
@@ -1156,12 +1197,28 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss, metrics = model(x, y)
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
-        x, y, epoch = next(train_loader)
+    if MG and step % args.mg_every == 0 and grad_accum_steps >= 2:
+        # split pairing: the first half of this step's micro-batches adapts, the second half is
+        # evaluated at the adapted point; the optimizer receives the ordinary full-batch mean gradient
+        half = grad_accum_steps // 2
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                loss, metrics = model(x, y)
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+            x, y, epoch = next(train_loader)
+            if micro_step == half - 1:
+                mg_kept, mg_alpha = mg_temporary_step(step)
+        with torch.no_grad():
+            torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
+        del mg_kept
+    else:
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                loss, metrics = model(x, y)
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+            x, y, epoch = next(train_loader)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
