@@ -23,23 +23,28 @@ TRAIN_SHUFFLE_SEED = 43
 
 
 def tokenize_documents(dataset_iter, encoder, token_budget):
-    """Tokenize documents from an iterator, recording document boundaries."""
+    """Tokenize documents from an iterator, recording document boundaries.
+
+    Tokens are written straight into a preallocated uint16 buffer, so peak
+    memory stays at 2 bytes/token instead of the ~40 bytes/token a Python
+    list of ints costs (28 B int object + 8 B pointer + list overallocation).
+    """
     bos_id = encoder._special_tokens["<|endoftext|>"]
-    tokens = []
+    tokens = np.empty(token_budget, dtype=np.uint16)
+    n = 0
     doc_starts = []
     pbar = tqdm(total=token_budget, unit="tok")
     for doc in dataset_iter:
         doc_tokens = [bos_id] + encoder.encode_ordinary(doc["text"])
-        doc_starts.append(len(tokens))
-        remaining = token_budget - len(tokens)
-        keep = min(len(doc_tokens), remaining)
-        tokens.extend(doc_tokens[:keep])
+        doc_starts.append(n)
+        keep = min(len(doc_tokens), token_budget - n)
+        tokens[n:n + keep] = doc_tokens[:keep]
+        n += keep
         pbar.update(keep)
-        if len(tokens) >= token_budget:
-            tokens = tokens[:token_budget]
+        if n >= token_budget:
             break
     pbar.close()
-    return np.asarray(tokens, dtype=np.uint16), np.asarray(doc_starts, dtype=np.int64)
+    return tokens[:n], np.asarray(doc_starts, dtype=np.int64)
 
 
 def write_datafile(filename, tokens, doc_starts, bos_id, shuffle_seed):
