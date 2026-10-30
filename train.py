@@ -102,7 +102,7 @@ parser.add_argument("--mg-step-schedule", type=str, default="lr", choices=["cons
                     help="lr: scale the step norm by the warmdown learning-rate multiplier")
 parser.add_argument("--mg-plastic", type=str, default="matrix_all", choices=["matrix_all", "mlp_all"])
 parser.add_argument("--schedule-steps", type=int, default=2085,
-                    help="Optimizer steps for the LR/SWA schedule; epochs follow the schedule (0 = derive from the data)")
+                    help="Optimizer steps for the LR/SWA schedule; epochs follow the schedule. The hardcoded sketch tables are laid out for 2085 steps")
 args = parser.parse_args()
 
 # Resolve output path
