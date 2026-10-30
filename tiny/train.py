@@ -132,7 +132,16 @@ parser.add_argument("--mg-every", type=int, default=1, help="meta-gradient step 
 parser.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
 parser.add_argument("--mg-step-schedule", type=str, default="const", choices=["const", "lr"])
 parser.add_argument("--mg-plastic", type=str, default="mlp_all", choices=["matrix_all", "mlp_all"])
+# --- post-hoc soup of trajectory averages (default for this entry; --soup 0 = entry 15) ---
+parser.add_argument("--soup", type=int, default=1, help="report the uniform probability mixture of the soup.json trajectory averages (0 = off = entry 15)")
+parser.add_argument("--soup-spec", type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "soup.json"))
 args = parser.parse_args()
+SOUP_SPEC = None
+if args.soup:
+    with open(args.soup_spec) as f:
+        SOUP_SPEC = json.load(f)
+    # the frozen block weights and member coefficients are tied to this exact step count
+    args.max_train_steps = SOUP_SPEC["horizon"]
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -1072,6 +1081,115 @@ def evaluate_bpb(
     return bpb, loss
 
 
+class TrajectorySoup:
+    """Post-hoc weight averages of the training trajectory, sketched in blocks.
+
+    Within block b (steps start..stop, 1-based iterates) two running sums are kept,
+    S_j = sum_t basis[t][j] * theta_t. At the block end each member m adds
+    sum_j coef[m][b][j] * S_j to its average, so after the last block member m holds
+    sum_t w_m(t) * theta_t for the frozen per-step weights w_m implied by soup.json.
+    All ranks hold identical parameters after the optimizer step, so every buffer is a
+    contiguous fp32 shard of the flattened parameter vector.
+    """
+
+    def __init__(self, spec, params, rank, world_size, device):
+        self.blocks = spec["blocks"]
+        self.coef = [m["coef"] for m in spec["members"]]
+        self.names = [m["name"] for m in spec["members"]]
+        self.weights = spec["weights"]
+        self.params = list(params)
+        self.world_size = world_size
+        self.total = sum(p.numel() for p in self.params)
+        self.chunk = (self.total + world_size - 1) // world_size
+        self.start = min(rank * self.chunk, self.total)
+        self.end = min(self.start + self.chunk, self.total)
+        n = self.end - self.start
+        self.plan = []
+        off = 0
+        for p in self.params:
+            lo, hi = max(off, self.start), min(off + p.numel(), self.end)
+            if lo < hi:
+                self.plan.append((p, lo - off, hi - off, lo - self.start, hi - self.start))
+            off += p.numel()
+        self.live = torch.zeros(n, dtype=torch.float32, device=device)
+        self.sketch = [torch.zeros(n, dtype=torch.float32, device=device) for _ in range(len(self.blocks[0]["basis"][0]))]
+        self.members = [torch.zeros(n, dtype=torch.float32, device=device) for _ in self.coef]
+        self.block = 0
+        self.pos = 0
+
+    @torch.no_grad()
+    def update(self, t):
+        blk = self.blocks[self.block]
+        assert t == blk["start"] + self.pos, (t, blk["start"], self.pos)
+        for p, s0, s1, d0, d1 in self.plan:
+            self.live[d0:d1].copy_(p.detach().reshape(-1)[s0:s1].float())
+        for j, s in enumerate(self.sketch):
+            c = blk["basis"][self.pos][j]
+            if c != 0.0:
+                s.add_(self.live, alpha=c)
+        self.pos += 1
+        if t == blk["stop"]:
+            for coef, acc in zip(self.coef, self.members):
+                for j, s in enumerate(self.sketch):
+                    acc.add_(s, alpha=coef[self.block][j])
+            for s in self.sketch:
+                s.zero_()
+            self.block += 1
+            self.pos = 0
+
+    @property
+    def done(self):
+        return self.block == len(self.blocks)
+
+    @torch.no_grad()
+    def load_member(self, k):
+        padded = torch.zeros(self.chunk, dtype=torch.float32, device=self.live.device)
+        padded[: self.end - self.start] = self.members[k]
+        if dist.is_initialized():
+            parts = [torch.empty_like(padded) for _ in range(self.world_size)]
+            dist.all_gather(parts, padded)
+            full = torch.cat(parts)[: self.total]
+        else:
+            full = padded[: self.total]
+        off = 0
+        for p in self.params:
+            p.copy_(full[off : off + p.numel()].view_as(p).to(p.dtype))
+            off += p.numel()
+
+
+@torch.no_grad()
+def evaluate_soup(model, soup, batches, token_bytes, num_iterations):
+    """Bits per byte and mean cross-entropy of the probability mixture sum_k w_k p_k(member k).
+
+    Same token accounting as evaluate_bpb; every member scores the same cached batches.
+    """
+    losses = []
+    for k in range(len(soup.members)):
+        soup.load_member(k)
+        parts = []
+        for x, y in batches:
+            parts.append(model(x, y, loss_reduction='none', num_iterations=num_iterations).view(-1).float())
+        losses.append(torch.cat(parts))
+        print0(f"  soup member {k}: {soup.names[k]}")
+    w = torch.tensor(soup.weights, dtype=torch.float32, device=losses[0].device)
+    mix = -torch.logsumexp(torch.log(w / w.sum())[:, None] - torch.stack(losses), dim=0)
+    y = torch.cat([y.view(-1) for _, y in batches])
+    mask = y != -1
+    num_bytes = token_bytes[y]
+    totals = torch.stack([
+        mix[mask].double().sum(),
+        mask.sum().double(),
+        (mix * (num_bytes > 0)).double().sum(),
+        num_bytes.double().sum(),
+    ])
+    if dist.is_initialized():
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    total_loss, total_tokens, total_nats, total_bytes = totals.tolist()
+    bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
+    loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
+    return bpb, loss
+
+
 def precompile_iteration_stages(model, x, y, mtp_weights, train_iteration_counts, eval_iteration_counts=None):
     train_iteration_counts = tuple(dict.fromkeys(train_iteration_counts))
     if eval_iteration_counts is None:
@@ -1376,6 +1494,13 @@ total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
 ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
+soup = None
+if SOUP_SPEC is not None:
+    assert num_train_steps == SOUP_SPEC["horizon"], (num_train_steps, SOUP_SPEC["horizon"])
+    soup = TrajectorySoup(SOUP_SPEC, orig_model.parameters(), ddp_rank, ddp_world_size, device)
+    print0(f"Soup: {len(soup.members)} trajectory averages over {len(soup.blocks)} blocks "
+           f"({(len(soup.members) + len(soup.sketch) + 1) * soup.live.numel() * 4 / 1e9:.2f} GB/rank), "
+           f"weights {[round(w, 4) for w in soup.weights]}")
 
 wall_clock_start = time.time()
 _swa_start_step = (num_train_steps - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
@@ -1390,7 +1515,7 @@ active_num_iterations = get_scheduled_iterations(
 active_expected_num_iterations = get_expected_scheduled_iterations(
     ITERATION_SCHEDULE, step, num_train_steps
 )
-precompile_eval_iteration_counts = tuple(
+precompile_eval_iteration_counts = () if soup is not None else tuple(
     dict.fromkeys(get_eval_iterations(count) for count in scheduled_iteration_counts)
 )
 precompile_iteration_stages(
@@ -1407,31 +1532,32 @@ if MG:
     _h = x.size(0) // 2
     precompile_iteration_stages(model, x[:_h], y[:_h], get_mtp_weights(step), scheduled_iteration_counts, ())
 
-# Initial val evaluation
-model.eval()
-val_loader = build_val_loader()
-eval_num_iterations = get_eval_iterations(active_num_iterations)
-with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(
-        model, val_loader, eval_steps, token_bytes, num_iterations=eval_num_iterations
+# Initial val evaluation (the soup reports only its final mixture)
+if soup is None:
+    model.eval()
+    val_loader = build_val_loader()
+    eval_num_iterations = get_eval_iterations(active_num_iterations)
+    with autocast_ctx:
+        val_bpb, val_loss = evaluate_bpb(
+            model, val_loader, eval_steps, token_bytes, num_iterations=eval_num_iterations
+        )
+    print0(
+        f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} "
+        f"| eval iters: {eval_num_iterations} | train iters: {active_num_iterations}"
     )
-print0(
-    f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} "
-    f"| eval iters: {eval_num_iterations} | train iters: {active_num_iterations}"
-)
-wandb_run.log({
-    "step": step,
-    "val/bpb": val_bpb,
-    "val/loss": val_loss,
-    "val/num_iterations": eval_num_iterations,
-    "val/train_num_iterations": active_num_iterations,
-    "val/train_expected_num_iterations": active_expected_num_iterations,
-    "val/train_expected_effective_layers": DEPTH * active_expected_num_iterations,
-    "val/train_actual_effective_layers": DEPTH * active_num_iterations,
-})
-if eval_num_iterations == NUM_ITERATIONS:
-    min_val_bpb = val_bpb
-    min_val_loss = val_loss
+    wandb_run.log({
+        "step": step,
+        "val/bpb": val_bpb,
+        "val/loss": val_loss,
+        "val/num_iterations": eval_num_iterations,
+        "val/train_num_iterations": active_num_iterations,
+        "val/train_expected_num_iterations": active_expected_num_iterations,
+        "val/train_expected_effective_layers": DEPTH * active_expected_num_iterations,
+        "val/train_actual_effective_layers": DEPTH * active_num_iterations,
+    })
+    if eval_num_iterations == NUM_ITERATIONS:
+        min_val_bpb = val_bpb
+        min_val_loss = val_loss
 model.train()
 
 while current_epoch <= args.num_epochs:
@@ -1510,6 +1636,8 @@ while current_epoch <= args.num_epochs:
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
         torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
+    if soup is not None:
+        soup.update(step + 1)
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -1546,6 +1674,8 @@ while current_epoch <= args.num_epochs:
         epoch = epoch_tensor.item()
 
     # Epoch boundary: evaluate when the dataloader advances to a new epoch
+    if epoch != current_epoch and soup is not None:
+        current_epoch = epoch  # no epoch evals or checkpoints: the soup is the only readout
     if epoch != current_epoch:
         model.eval()
         val_loader = build_val_loader()
@@ -1602,7 +1732,7 @@ while current_epoch <= args.num_epochs:
         gc.collect(); gc.freeze(); gc.disable()
 
 # Final EMA evaluation
-if ema_params is not None:
+if soup is None and ema_params is not None:
     ema_updates = step // args.update_ema_every
     if ema_updates > 0:
         correction = 1.0 / (1.0 - param_ema_beta ** ema_updates)
@@ -1655,6 +1785,18 @@ if len(late_ckpt_paths) >= 2:
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
 
+# Soup: rebuild every trajectory average and score their uniform probability mixture
+if soup is not None:
+    assert soup.done, f"soup stopped at block {soup.block}/{len(soup.blocks)}"
+    model.eval()
+    val_loader = build_val_loader()
+    soup_batches = [next(val_loader)[:2] for _ in range(eval_steps)]
+    with autocast_ctx:
+        val_bpb, val_loss = evaluate_soup(model, soup, soup_batches, token_bytes, NUM_ITERATIONS)
+    print0(f"Soup Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} | members: {len(soup.members)} | iters: {NUM_ITERATIONS}")
+    wandb_run.log({"soup/bpb": val_bpb, "soup/loss": val_loss, "soup/num_iterations": NUM_ITERATIONS})
+    min_val_loss, min_val_bpb = val_loss, val_bpb
+
 # Summary
 wall_clock_time = time.time() - wall_clock_start
 print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
@@ -1694,8 +1836,8 @@ if master_process:
         json.dump(result, f, indent=2)
     print0(f"Result saved to {result_path}")
 
-# Save final model
-if master_process:
+# Save final model (with the soup the live weights are its last member, not a final model)
+if master_process and soup is None:
     print0(f"Saving model to {artifact_model_path}")
     torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, artifact_model_path)
 
